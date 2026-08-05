@@ -1,0 +1,42 @@
+---
+# Guard: the Zabbix server's own host object must be monitored by the SERVER,
+# never by a proxy.
+#
+# A dead-man's-switch heartbeat is typically an HTTP agent item on this host
+# object. If the host is monitored by a proxy, the PROXY executes that item, and
+# because proxies buffer while the server is unreachable, it keeps pinging the
+# external switch for as long as ProxyOfflineBuffer allows -- commonly a week.
+# The switch reports green throughout the outage it exists to detect.
+#
+# ⚠ This cannot fire in a proxy-less deployment. That is the point: by the time
+# proxies are added, the interaction is easy to forget, and the symptom is a
+# switch that simply never alerts.
+
+- name: Look up the server's own host object
+  community.zabbix.zabbix_host_info:
+    host_name: "{{ zabbix_host_technical_name | default(inventory_hostname) }}"
+  register: _zbx_self
+  # The host object does not exist during the very first build.
+  failed_when: false
+
+- name: Assert the server host object is not monitored by a proxy
+  ansible.builtin.fail:
+    msg: >-
+      The Zabbix server's own host object
+      ({{ zabbix_host_technical_name | default(inventory_hostname) }}) is
+      monitored by a PROXY, not by the server. A dead-man's-switch heartbeat item
+      on this host would then be executed by the proxy, which buffers for
+      ProxyOfflineBuffer and would hold the external switch GREEN long after the
+      server died. Set "Monitored by" to Zabbix server.
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - _zbx_self.hosts | default([]) | length > 0
+    - (_zbx_self.hosts[0].proxy_hostid | default('0')) not in ['0', 0, None]
+
+- name: Remind that the heartbeat item itself is not yet verified
+  ansible.builtin.debug:
+    msg: >-
+      TODO: verify the heartbeat HTTP agent item exists on this host and is
+      enabled. A switch that was never configured is indistinguishable from one
+      that is working, until the day it matters.
+  when: zabbix_deadmans_switch_enabled | default(false) | bool

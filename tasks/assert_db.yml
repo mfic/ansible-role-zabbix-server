@@ -1,0 +1,50 @@
+---
+# Pre-flight guard: refuse to start the stack against a database that is about to
+# be silently recreated empty.
+#
+# Confirmed in the upstream source: pgsql.sh rebuilds database and schema on an
+# `info` log line and exits 0. pg_isready, service_healthy,
+# service_completed_successfully and the frontend /ping ALL pass afterwards, and
+# an external heartbeat never fires either, because the server really is alive.
+# The only symptom is that every historical metric is gone.
+#
+# Nothing upstream prevents this. This file is the prevention.
+
+- name: Check whether the PostgreSQL data directory exists
+  ansible.builtin.stat:
+    path: "{{ zabbix_server_data_dir }}/postgresql/data/PG_VERSION"
+  register: _zbx_pgdata
+
+- name: Fail when an existing database was expected but the data directory is empty
+  ansible.builtin.fail:
+    msg: >-
+      REFUSING TO START. {{ zabbix_server_data_dir }}/postgresql/data holds no
+      PG_VERSION, so PostgreSQL would initialise a NEW, EMPTY cluster and Zabbix
+      would rebuild its schema and come up green with zero history. Every
+      healthcheck would pass and the dead-man's switch would stay silent.
+      If this really is the first build, set zabbix_server_db_expect_existing=false
+      for this run only. If it is not, STOP: the durable volume is missing or
+      mounted at the wrong path, and starting the stack destroys nothing but
+      hides everything.
+  when:
+    - zabbix_server_assert_db_not_empty | bool
+    - zabbix_server_db_expect_existing | bool
+    - not _zbx_pgdata.stat.exists
+
+- name: Assert the data directory is a real mount, not a path inside the container layer
+  # The second silent route: mounting /var/lib/postgresql instead of
+  # /var/lib/postgresql/data creates an ANONYMOUS volume that disappears on the
+  # next `up --force-recreate`. The bind must resolve to a real device.
+  ansible.builtin.command:
+    cmd: "findmnt --target {{ zabbix_server_data_dir }} --noheadings --output SOURCE"
+  register: _zbx_mount
+  changed_when: false
+  failed_when: false
+
+- name: Warn when the data directory is not on its own mount
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ zabbix_server_data_dir }} does not resolve to a dedicated
+      mount ({{ _zbx_mount.stdout | default('unresolved') }}). Confirm this is
+      the intended durable storage and not the root filesystem.
+  when: _zbx_mount.rc != 0 or _zbx_mount.stdout | trim == ''

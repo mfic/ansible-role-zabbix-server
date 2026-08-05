@@ -1,0 +1,70 @@
+---
+# Defaults. Behaviour lives here; site data comes from the consuming inventory.
+
+# ── Images and versions ──────────────────────────────────────────────────────
+# The upstream default tag `alpine-7.0-latest` FLOATS. Pin it.
+# Upstream documents no alpine-vs-ubuntu tradeoff -- alpine because it is the
+# default, not because a source prefers it.
+zabbix_server_version: "7.0.29"
+zabbix_server_image_flavour: alpine
+zabbix_server_compose_ref: "7.0"          # branch of zabbix/zabbix-docker
+
+# Render the compose file from this role rather than checking out zabbix-docker
+# and `git pull`ing it -- the upstream upgrade docs warn that `git pull`
+# overwrites local edits.
+zabbix_server_compose_dir: /opt/zabbix
+zabbix_server_data_dir: /opt/zabbix/data
+
+# ── Database ─────────────────────────────────────────────────────────────────
+zabbix_server_db_engine: postgresql
+zabbix_server_db_image: "postgres:16-alpine"
+
+# TimescaleDB is off by default, and that default is load-bearing:
+# ENABLE_TIMESCALEDB acts only at SCHEMA-CREATION time, so it cannot be switched
+# on later -- adopting it after the fact means a rebuild and restore.
+#
+# ⚠ If you do enable it, review the compression threshold against any proxy
+# buffering you rely on. TimescaleDB's own default compresses records older than
+# 7 days, and Zabbix documents that late-arriving data older than the threshold
+# "will be discarded". A proxy that reconnects after a long outage delivers its
+# buffer straight into that window, and the backfill is silently dropped. Keep
+# the threshold clear of the buffer with real margin.
+zabbix_server_timescaledb: false
+zabbix_server_timescaledb_compress_after_days: 14   # only meaningful if enabled
+
+# ⚠ Upstream sets no shm_size; the documented 64 MB default is too small.
+zabbix_server_db_shm_size: 256m
+# ⚠ Upstream ships 1m, against an image whose own Dockerfile warns that even 90s
+# may not suffice (STOPSIGNAL SIGINT = fast shutdown).
+zabbix_server_db_stop_grace_period: 120s
+
+# ── Services ─────────────────────────────────────────────────────────────────
+# The upstream .env_srv ships both of these TRUE, so a default install starts
+# Java pollers against a gateway that does not exist and an SNMP trapper reading
+# a file nobody writes. Off unless something actually needs them.
+zabbix_server_enable_java_gateway: false
+zabbix_server_enable_snmp_traps: false
+
+# ── Locale and identity (upstream defaults are rarely what you want) ─────────
+zabbix_server_php_tz: "Etc/UTC"                 # upstream default: Europe/Riga
+zabbix_server_name: "Zabbix"                    # upstream: "Composed installation"
+
+# ── Safety assertions — see README. Do not default these to false. ───────────
+# Refuse to start the stack if a database was expected but its data directory is
+# absent or empty. Guards the "green, empty Zabbix" failure.
+zabbix_server_assert_db_not_empty: true
+# Expect an existing DB. Set false ONLY for a genuine first build.
+zabbix_server_db_expect_existing: true
+
+# Verify via the API that the server's own host object is monitored by the
+# SERVER, never a proxy. Guards a heartbeat that a proxy would keep answering.
+zabbix_server_assert_monitored_by_server: true
+
+# ── Housekeeping ─────────────────────────────────────────────────────────────
+# ⚠ Both overrides must be enabled or the housekeeper removes nothing.
+zabbix_server_housekeeping_override_history: true
+zabbix_server_housekeeping_override_trends: true
+# History dominates trends on disk by roughly 100x (90 vs 8 bytes per value), so
+# short history with long trends is usually the right shape for capacity data.
+zabbix_server_history_retention: "31d"
+zabbix_server_trends_retention: "730d"

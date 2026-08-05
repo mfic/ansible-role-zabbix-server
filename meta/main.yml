@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: zabbix_server
+  namespace: mfic
+  author: Jan Quest
+  description: Zabbix 7.0 LTS server as a Docker Compose stack on Debian
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+        - trixie
+  galaxy_tags:
+    - zabbix
+    - monitoring
+    - docker
+    - compose
+
+dependencies: []

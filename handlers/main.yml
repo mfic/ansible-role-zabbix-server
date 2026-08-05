@@ -1,0 +1,5 @@
+---
+# Handlers, to be filled in with the deployment tasks.
+- name: restart zabbix stack
+  ansible.builtin.debug:
+    msg: TODO
