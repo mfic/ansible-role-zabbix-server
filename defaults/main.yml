@@ -98,6 +98,85 @@ zabbix_server_restart_policy: unless-stopped
 zabbix_server_enable_java_gateway: false
 zabbix_server_enable_snmp_traps: false
 
+# ── Publishing the frontend (both off by default) ────────────────────────────
+# Two independent, optional front doors for the loopback-bound frontend above.
+# Both are rendered into the same Compose project rather than deployed as a
+# separate stack, so the thing that publishes the UI shares its lifecycle with
+# the UI: one `docker compose up` brings the pair back after a reboot, and there
+# is no second unit that can be down while the first still looks healthy.
+#
+# ⚠ Enabling either does NOT move the frontend off loopback, and should not. The
+# 127.0.0.1 publish is the rung BELOW both of these -- what an operator reaches
+# over `ssh -L` when the tunnel, the proxy, the certificate or DNS is itself the
+# thing that is broken.
+
+# ── Traefik: TLS reverse proxy on the host itself ────────────────────────────
+# File provider only -- NO Docker socket is mounted. Label-based discovery would
+# mean handing a network-facing container root-equivalent control of the daemon
+# running the database, in order to route a single fixed backend that is already
+# known at render time. The routers are rendered from the variables below.
+zabbix_server_enable_traefik: false
+# ⚠ PINNED, and this is not boilerplate. An unpinned `image: traefik` walked one
+# estate's ingress from v2 to v3 across an unrelated `docker pull`; v3 rejects v2
+# configuration outright, so the proxy came back refusing to start.
+zabbix_server_traefik_image: "traefik:v3.7.10"
+# Published on all interfaces: being reachable is the entire point of this one.
+zabbix_server_traefik_listen_address: "0.0.0.0"
+zabbix_server_traefik_http_port: 80
+zabbix_server_traefik_https_port: 443
+# The name the certificate is issued for and the router matches on. No default:
+# a wrong value here asks a public CA for somebody else's name.
+zabbix_server_traefik_hostname: ""
+zabbix_server_traefik_log_level: "INFO"
+
+# ACME. DNS-01 only -- HTTP-01 would need the name publicly reachable on port
+# 80, which is exactly what a VPN-only frontend is not.
+zabbix_server_traefik_acme_email: ""
+zabbix_server_traefik_acme_ca_server: "https://acme-v02.api.letsencrypt.org/directory"
+# Staging, for rehearsing issuance without spending the production rate limit
+# (5 duplicate certificates per week -- cheap to repeat until suddenly it isn't):
+#   https://acme-staging-v02.api.letsencrypt.org/directory
+zabbix_server_traefik_acme_dns_provider: "cloudflare"
+
+# ⚠ LOAD-BEARING, NOT A TUNING KNOB. lego uses these resolvers for two things:
+# finding the zone that should hold the challenge record (it walks up looking
+# for an SOA), and checking the record has propagated. Left unset it uses the
+# container's resolver -- i.e. the site's own DNS.
+#
+# On a split-horizon estate that fails in a way that reads as a broken API
+# token. If the local resolver is authoritative for the sub-zone the name sits
+# in, the SOA walk stops there, lego asks the DNS provider to create a record in
+# a zone the provider has never heard of, and the propagation check then queries
+# a server that is authoritative for the name and answers NXDOMAIN with full
+# authority -- so it never succeeds, and never will.
+#
+# Public resolvers see the same view the ACME server does. That is the only view
+# that matters here.
+zabbix_server_traefik_acme_dns_resolvers:
+  - "1.1.1.1:53"
+  - "9.9.9.9:53"
+# API token for the DNS provider, scoped to edit records in ONE zone. Supplied
+# by the consuming inventory from vault or SOPS; no default, deliberately.
+zabbix_server_traefik_dns_api_token: ""
+
+# ── cloudflared: outbound-only tunnel to the Cloudflare edge ─────────────────
+# Locally managed: the ingress rules are rendered from the variables below and
+# live in the consuming repo, so a rebuild reproduces the routing. A
+# token-configured ("remotely managed") tunnel keeps them in the Cloudflare
+# dashboard instead, where they are neither in a diff nor restored by this role.
+zabbix_server_enable_cloudflared: false
+zabbix_server_cloudflared_image: "cloudflare/cloudflared:2026.7.3"
+# UUID of a tunnel created out of band, and the public hostname routed to it.
+zabbix_server_cloudflared_tunnel_id: ""
+zabbix_server_cloudflared_hostname: ""
+# The tunnel's credentials JSON, verbatim. Secret -- vault or SOPS.
+zabbix_server_cloudflared_credentials: ""
+# ⚠ cloudflared reaches the frontend over the Compose network, NOT through
+# Traefik. Cloudflare terminates TLS at its own edge, so routing it through
+# Traefik would demand a second certificate for the public name -- obtained by
+# DNS-01 for a hostname whose whole purpose is being reachable without the LAN.
+zabbix_server_cloudflared_metrics_port: 2000
+
 # ── Locale and identity (upstream defaults are rarely what you want) ─────────
 zabbix_server_php_tz: "Etc/UTC"                 # upstream default: Europe/Riga
 zabbix_server_name: "Zabbix"                    # upstream: "Composed installation"

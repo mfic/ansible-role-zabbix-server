@@ -1,0 +1,70 @@
+# {{ ansible_managed }}
+#
+# Traefik STATIC configuration. Rendered by mfic.zabbix_server — DO NOT EDIT ON
+# THE HOST, the next run overwrites it.
+#
+# Static means "read once at startup". Changing anything in this file requires
+# restarting the container; the routers in dynamic/ are re-read while running.
+
+log:
+  level: {{ zabbix_server_traefik_log_level }}
+
+# On by default here. This proxy fronts the estate's monitoring UI, so "who
+# reached the frontend, and did they get a certificate error" is a question
+# somebody will eventually need answered, and it cannot be answered
+# retrospectively if nothing was written down.
+accessLog: {}
+
+# ⚠ The API and dashboard are OFF, and there is no router for them below. They
+# expose every route, service and TLS certificate this proxy knows about, and
+# they authenticate nothing on their own.
+api:
+  dashboard: false
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      # Port 80 exists ONLY to redirect. ACME here is DNS-01, so nothing needs
+      # to be served over plaintext, and a human who types the hostname without
+      # a scheme should not be silently downgraded.
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  # File provider only — no Docker socket. See the compose template.
+  #
+  # `watch: true` means a re-render of the routers takes effect without a
+  # restart, which matters because a restart drops in-flight connections to the
+  # UI somebody is probably staring at while deploying.
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "{{ zabbix_server_traefik_acme_email }}"
+      caServer: "{{ zabbix_server_traefik_acme_ca_server }}"
+      # ⚠ One file, mode 0600, holding the account key AND every issued
+      # certificate. It is on the persistent data filesystem on purpose: lose it
+      # and every renewal becomes a fresh issuance against the rate limit.
+      storage: /etc/traefik/acme/acme.json
+      dnsChallenge:
+        provider: {{ zabbix_server_traefik_acme_dns_provider }}
+        # ⚠ PUBLIC resolvers, and this is load-bearing rather than tuning — see
+        # the long note on zabbix_server_traefik_acme_dns_resolvers in the
+        # role's defaults. Short version: on a split-horizon estate, letting
+        # lego use the site's own resolver makes it look for the zone in the
+        # wrong place and then wait forever for a record it asked the wrong
+        # server about. It fails looking exactly like a bad API token.
+        resolvers:
+        {% for resolver in zabbix_server_traefik_acme_dns_resolvers %}
+          - "{{ resolver }}"
+        {% endfor %}

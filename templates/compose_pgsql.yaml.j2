@@ -188,6 +188,81 @@ services:
       - zabbix
 
   {% endif %}
+  {% if zabbix_server_enable_traefik | bool %}
+  # ⚠ NO Docker socket. Routing is rendered from role variables into
+  # dynamic/zabbix.yaml and picked up by the file provider, because the only
+  # backend is a fixed one that is already known when this file is written.
+  # Label discovery would buy nothing here and would cost the daemon that runs
+  # the database being controllable by the one container facing the network.
+  traefik:
+    image: {{ zabbix_server_traefik_image }}
+    container_name: zabbix-traefik
+    restart: {{ zabbix_server_restart_policy }}
+    # The frontend must be answering before anything routes to it, or the first
+    # request after a reboot meets a 502 from a proxy that started faster.
+    depends_on:
+      zabbix-web:
+        condition: service_started
+    # No `command:`. Every static setting lives in traefik.yaml, which is a file
+    # a human can read and diff; flags here would be a second, invisible half of
+    # the same configuration.
+    ports:
+      - "{{ zabbix_server_traefik_listen_address }}:{{ zabbix_server_traefik_http_port }}:80"
+      - "{{ zabbix_server_traefik_listen_address }}:{{ zabbix_server_traefik_https_port }}:443"
+    environment:
+      # Read by lego's cloudflare provider. In the .env file, not here, so the
+      # compose file stays diffable in full without leaking it.
+      CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN:?CF_DNS_API_TOKEN is unset — refusing to start}
+    volumes:
+      - {{ zabbix_server_data_dir }}/traefik/traefik.yaml:/etc/traefik/traefik.yaml:ro
+      - {{ zabbix_server_data_dir }}/traefik/dynamic:/etc/traefik/dynamic:ro
+      # ⚠ acme.json holds the private key and must be 0600. Traefik refuses to
+      # start otherwise -- which is the correct behaviour, and the reason this
+      # is a bind mount to a file the role creates with that mode rather than a
+      # directory Docker would create as 0755 root.
+      - {{ zabbix_server_data_dir }}/traefik/acme/acme.json:/etc/traefik/acme/acme.json
+    stop_grace_period: 30s
+    networks:
+      - zabbix
+
+  {% endif %}
+  {% if zabbix_server_enable_cloudflared | bool %}
+  # Outbound-only: the tunnel dials the Cloudflare edge, so nothing inbound is
+  # opened on this host or its firewall for the public path.
+  cloudflared:
+    image: {{ zabbix_server_cloudflared_image }}
+    container_name: zabbix-cloudflared
+    restart: {{ zabbix_server_restart_policy }}
+    depends_on:
+      zabbix-web:
+        condition: service_started
+    # The image's entrypoint is already `cloudflared --no-autoupdate`, so this
+    # appends to it rather than repeating either. Pinning the tag is what fixes
+    # the version; a binary that replaces itself in place would make the running
+    # version a function of uptime rather than of this file.
+    command: tunnel --config /etc/cloudflared/config.yaml run
+    volumes:
+      - {{ zabbix_server_data_dir }}/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
+      - {{ zabbix_server_data_dir }}/cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
+    # `ready` reports the state of the connections to the edge, so this is a
+    # healthcheck of the TUNNEL and not merely of the process. A cloudflared
+    # that is running but has no registered connection serves nothing while
+    # looking entirely alive to `docker ps`.
+    #
+    # ⚠ --metrics is a TUNNEL command option, so it goes between `tunnel` and
+    # `ready`. Placed anywhere else it is rejected, and the healthcheck then
+    # fails for a reason that has nothing to do with the tunnel's state.
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:{{ zabbix_server_cloudflared_metrics_port }}", "ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 30s
+    networks:
+      - zabbix
+
+  {% endif %}
 networks:
   zabbix:
     name: zabbix

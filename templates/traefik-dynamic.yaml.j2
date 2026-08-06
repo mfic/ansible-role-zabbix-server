@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+#
+# Traefik DYNAMIC configuration — routers, services, middlewares. Rendered by
+# mfic.zabbix_server; DO NOT EDIT ON THE HOST.
+#
+# Re-read while Traefik runs (`providers.file.watch`), so changes here do not
+# need a restart and do not drop connections.
+
+http:
+  routers:
+    zabbix-web:
+      rule: "Host(`{{ zabbix_server_traefik_hostname }}`)"
+      entryPoints:
+        - websecure
+      service: zabbix-web
+      middlewares:
+        - zabbix-headers
+      tls:
+        certResolver: letsencrypt
+        # ⚠ EXACT NAME, no SANs and no wildcard. A wildcard would need the
+        # challenge for the parent name and would then be a certificate for
+        # every host in the zone, sitting on the one box whose job is to still
+        # be trustworthy when other things are not.
+        domains:
+          - main: "{{ zabbix_server_traefik_hostname }}"
+
+  services:
+    zabbix-web:
+      loadBalancer:
+        servers:
+          # Over the Compose network, by container name. NOT via the host's
+          # 127.0.0.1 publish — that binding is the break-glass path and stays
+          # independent of this proxy on purpose.
+          - url: "http://zabbix-web:8080"
+
+  middlewares:
+    zabbix-headers:
+      headers:
+        # The frontend is served plain HTTP inside the Compose network, so
+        # without this PHP builds absolute URLs with the wrong scheme and the
+        # browser refuses the resulting mixed content.
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"

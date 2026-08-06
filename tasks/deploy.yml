@@ -19,6 +19,41 @@
       supply it from vault or SOPS in the consuming inventory.
     quiet: true
 
+- name: Assert Traefik has everything it needs
+  # Every one of these is a value whose absence produces a confusing failure
+  # rather than an obvious one: an empty hostname asks a public CA for a
+  # certificate for the empty name, an empty ACME email is rejected at account
+  # registration after the container is already up, and an empty API token
+  # fails DNS-01 in a way that looks identical to the split-horizon resolver
+  # trap this role goes out of its way to avoid.
+  ansible.builtin.assert:
+    that:
+      - zabbix_server_traefik_hostname | length > 0
+      - zabbix_server_traefik_acme_email | length > 0
+      - zabbix_server_traefik_dns_api_token | length > 0
+    fail_msg: >-
+      zabbix_server_enable_traefik is true, but one of
+      zabbix_server_traefik_hostname / _acme_email / _dns_api_token is empty.
+      The role ships no defaults for these: the hostname decides what a public
+      CA is asked to certify, and the token is a secret the consuming inventory
+      must supply from vault or SOPS.
+    quiet: true
+  when: zabbix_server_enable_traefik | bool
+
+- name: Assert cloudflared has everything it needs
+  ansible.builtin.assert:
+    that:
+      - zabbix_server_cloudflared_tunnel_id | length > 0
+      - zabbix_server_cloudflared_hostname | length > 0
+      - zabbix_server_cloudflared_credentials | length > 0
+    fail_msg: >-
+      zabbix_server_enable_cloudflared is true, but one of
+      zabbix_server_cloudflared_tunnel_id / _hostname / _credentials is empty.
+      The tunnel is created out of band; this role only runs it. A tunnel id
+      without its credentials file starts a container that retries forever.
+    quiet: true
+  when: zabbix_server_enable_cloudflared | bool
+
 - name: Verify the docker service is enabled
   # The stack's restart policy is the ONLY thing bringing Zabbix back after an
   # unplanned reboot -- there is no systemd unit for the stack itself. If
@@ -76,6 +111,96 @@
       group: "{{ zabbix_server_gid }}"
   loop_control:
     label: "{{ item.path }}"
+
+# ── Traefik ──────────────────────────────────────────────────────────────────
+# Under the data directory, so the ACME account key and the issued certificates
+# survive a rebuild on the same durable filesystem as the database. Losing
+# acme.json is not fatal but is not free either: every renewal becomes a fresh
+# issuance, counted against the CA's rate limit.
+
+- name: Create the Traefik directories
+  ansible.builtin.file:
+    path: "{{ zabbix_server_data_dir }}/traefik/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - dynamic
+    - acme
+  when: zabbix_server_enable_traefik | bool
+
+- name: Create the ACME storage file with the mode Traefik demands
+  # ⚠ It must exist BEFORE the container starts, and it must be 0600. Docker
+  # creates a missing bind-mount source as a DIRECTORY owned by root, and
+  # Traefik then fails with a message about the storage file that does not say
+  # "this is a directory". Traefik also refuses outright if the permissions are
+  # wider than 0600 -- correctly, since this file holds the private keys.
+  ansible.builtin.copy:
+    content: "{}"
+    dest: "{{ zabbix_server_data_dir }}/traefik/acme/acme.json"
+    owner: root
+    group: root
+    mode: "0600"
+    # Created once, then owned by Traefik. Without this every run would
+    # overwrite the account key and every certificate with an empty object.
+    force: false
+  when: zabbix_server_enable_traefik | bool
+
+- name: Render the Traefik static configuration
+  ansible.builtin.template:
+    src: traefik.yaml.j2
+    dest: "{{ zabbix_server_data_dir }}/traefik/traefik.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  when: zabbix_server_enable_traefik | bool
+
+- name: Render the Traefik routers
+  ansible.builtin.template:
+    src: traefik-dynamic.yaml.j2
+    dest: "{{ zabbix_server_data_dir }}/traefik/dynamic/zabbix.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+  when: zabbix_server_enable_traefik | bool
+
+# ── cloudflared ──────────────────────────────────────────────────────────────
+# ⚠ This image runs as uid 65532 (nonroot), verified from the image config —
+# unlike every other container in this stack. Files it must read are owned by
+# that uid, not by root. Root-owned 0600 credentials here produce a container
+# that starts, fails to read its own credentials and retries forever, with the
+# tunnel simply never registering.
+
+- name: Create the cloudflared directory
+  ansible.builtin.file:
+    path: "{{ zabbix_server_data_dir }}/cloudflared"
+    state: directory
+    owner: "65532"
+    group: "65532"
+    mode: "0750"
+  when: zabbix_server_enable_cloudflared | bool
+
+- name: Render the cloudflared configuration
+  ansible.builtin.template:
+    src: cloudflared.yaml.j2
+    dest: "{{ zabbix_server_data_dir }}/cloudflared/config.yaml"
+    owner: "65532"
+    group: "65532"
+    mode: "0640"
+  when: zabbix_server_enable_cloudflared | bool
+
+- name: Install the tunnel credentials
+  # 0400: read-only to the one uid that needs it. This file is the tunnel --
+  # anyone holding it can serve traffic as it, from anywhere.
+  ansible.builtin.copy:
+    content: "{{ zabbix_server_cloudflared_credentials }}"
+    dest: "{{ zabbix_server_data_dir }}/cloudflared/credentials.json"
+    owner: "65532"
+    group: "65532"
+    mode: "0400"
+  no_log: true
+  when: zabbix_server_enable_cloudflared | bool
 
 - name: Render the database credentials
   ansible.builtin.template:
@@ -176,3 +301,46 @@
   # alive. It does NOT prove the database is the right one -- a freshly
   # initialised empty Zabbix answers this identically. That is what the
   # pre-flight guard in assert_db.yml is for; this check is liveness only.
+
+- name: Wait for Traefik to accept TLS connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 443
+    timeout: 120
+  when: zabbix_server_enable_traefik | bool
+
+- name: Read back the certificate Traefik is actually serving
+  # DNS-01 issuance happens asynchronously AFTER Traefik is already listening,
+  # so a successful handshake proves nothing about the certificate. Until lego
+  # finishes, Traefik answers with its own built-in self-signed
+  # "TRAEFIK DEFAULT CERT" -- a working HTTPS endpoint that every browser
+  # rejects. Retried rather than checked once, because a first issuance takes
+  # as long as the DNS record takes to propagate.
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      echo | openssl s_client -connect 127.0.0.1:443
+      -servername {{ zabbix_server_traefik_hostname | quote }} 2>/dev/null
+      | openssl x509 -noout -issuer -subject -enddate
+    executable: /bin/bash
+  register: _zbx_cert
+  changed_when: false
+  # Deliberately matches on the DEFAULT cert rather than on an expected issuer
+  # name: it is the one string that unambiguously means "ACME has not
+  # succeeded", and it stays true whether the CA is Let's Encrypt production,
+  # its staging endpoint, or something else entirely.
+  until:
+    - _zbx_cert.rc == 0
+    - "'TRAEFIK DEFAULT CERT' not in _zbx_cert.stdout"
+    - "'issuer=' in _zbx_cert.stdout"
+  retries: 30
+  delay: 10
+  when: zabbix_server_enable_traefik | bool
+
+- name: Show the certificate in the run output
+  # The issuer and expiry belong in the log of the run that published the
+  # frontend. Otherwise the first time anybody looks at them is after a browser
+  # has complained, which is months later and on somebody else's schedule.
+  ansible.builtin.debug:
+    msg: "{{ _zbx_cert.stdout_lines }}"
+  when: zabbix_server_enable_traefik | bool
