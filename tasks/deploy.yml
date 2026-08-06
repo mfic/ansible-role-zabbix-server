@@ -96,7 +96,17 @@
     mode: "0640"
     # A compose file that does not parse takes the stack down on the next `up`,
     # so validate before replacing the working one.
-    validate: "docker compose -f %s config --quiet"
+    #
+    # ⚠ --env-file is REQUIRED, not a refinement. Ansible validates against a
+    # temporary copy in its own tmp directory, and Compose resolves `.env`
+    # relative to the file it was given -- so without this the validation runs
+    # with no environment at all, every `${POSTGRES_PASSWORD:?...}` reference is
+    # unset, and the task fails with "required variable POSTGRES_PASSWORD is
+    # missing a value" on a compose file that is perfectly correct. The failure
+    # is at least loud; the trap is that it looks like a credential problem and
+    # invites someone to weaken the `:?` guard that exists to stop PostgreSQL
+    # starting with no password.
+    validate: "docker compose --env-file {{ zabbix_server_compose_dir }}/.env -f %s config --quiet"
   notify: Restart zabbix stack
 
 - name: Bring the stack up
