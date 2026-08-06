@@ -1,2 +1,8 @@
 *.retry
 .venv/
+
+# ansible-lint creates .ansible/roles/<namespace.role> as a SYMLINK back to this
+# checkout so the role resolves by name. Committing it breaks `ansible-galaxy
+# install`: core >= 2.21 refuses any tar member whose link target escapes the
+# role directory, and the install fails leaving the role directory EMPTY.
+.ansible/
