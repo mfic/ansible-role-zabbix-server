@@ -40,17 +40,17 @@
     quiet: true
   when: zabbix_server_enable_traefik | bool
 
-- name: Assert cloudflared has everything it needs
+- name: Assert cloudflared has a tunnel token
   ansible.builtin.assert:
     that:
-      - zabbix_server_cloudflared_tunnel_id | length > 0
-      - zabbix_server_cloudflared_hostname | length > 0
-      - zabbix_server_cloudflared_credentials | length > 0
+      - zabbix_server_cloudflared_tunnel_token | length > 0
     fail_msg: >-
-      zabbix_server_enable_cloudflared is true, but one of
-      zabbix_server_cloudflared_tunnel_id / _hostname / _credentials is empty.
-      The tunnel is created out of band; this role only runs it. A tunnel id
-      without its credentials file starts a container that retries forever.
+      zabbix_server_enable_cloudflared is true but
+      zabbix_server_cloudflared_tunnel_token is empty. The tunnel is created out
+      of band in the Cloudflare dashboard; this role only runs the connector.
+      Without the token the container starts and retries forever without ever
+      registering, which looks like a network problem rather than a missing
+      credential.
     quiet: true
   when: zabbix_server_enable_cloudflared | bool
 
@@ -166,41 +166,11 @@
   when: zabbix_server_enable_traefik | bool
 
 # ── cloudflared ──────────────────────────────────────────────────────────────
-# ⚠ This image runs as uid 65532 (nonroot), verified from the image config —
-# unlike every other container in this stack. Files it must read are owned by
-# that uid, not by root. Root-owned 0600 credentials here produce a container
-# that starts, fails to read its own credentials and retries forever, with the
-# tunnel simply never registering.
-
-- name: Create the cloudflared directory
-  ansible.builtin.file:
-    path: "{{ zabbix_server_data_dir }}/cloudflared"
-    state: directory
-    owner: "65532"
-    group: "65532"
-    mode: "0750"
-  when: zabbix_server_enable_cloudflared | bool
-
-- name: Render the cloudflared configuration
-  ansible.builtin.template:
-    src: cloudflared.yaml.j2
-    dest: "{{ zabbix_server_data_dir }}/cloudflared/config.yaml"
-    owner: "65532"
-    group: "65532"
-    mode: "0640"
-  when: zabbix_server_enable_cloudflared | bool
-
-- name: Install the tunnel credentials
-  # 0400: read-only to the one uid that needs it. This file is the tunnel --
-  # anyone holding it can serve traffic as it, from anywhere.
-  ansible.builtin.copy:
-    content: "{{ zabbix_server_cloudflared_credentials }}"
-    dest: "{{ zabbix_server_data_dir }}/cloudflared/credentials.json"
-    owner: "65532"
-    group: "65532"
-    mode: "0400"
-  no_log: true
-  when: zabbix_server_enable_cloudflared | bool
+# Nothing to create on disk. A token-configured connector carries its whole
+# credential in TUNNEL_TOKEN and fetches its routing from Cloudflare, so there
+# is no config file, no credentials file and no directory to own. (That also
+# sidesteps this image running as uid 65532 rather than root, which is the trap
+# a mounted credentials file would otherwise walk into.)
 
 - name: Render the database credentials
   ansible.builtin.template:

@@ -160,21 +160,27 @@ zabbix_server_traefik_acme_dns_resolvers:
 zabbix_server_traefik_dns_api_token: ""
 
 # ── cloudflared: outbound-only tunnel to the Cloudflare edge ─────────────────
-# Locally managed: the ingress rules are rendered from the variables below and
-# live in the consuming repo, so a rebuild reproduces the routing. A
-# token-configured ("remotely managed") tunnel keeps them in the Cloudflare
-# dashboard instead, where they are neither in a diff nor restored by this role.
+# TOKEN-configured, i.e. "remotely managed": the tunnel's ingress rules live in
+# the Cloudflare Zero Trust dashboard, and this role only runs the connector.
+#
+# ⚠ THE ROUTING IS THEREFORE NOT IN THIS REPO. A rebuild from source restores a
+# connector that serves whatever the dashboard says -- which is convenient while
+# the dashboard is right and invisible when it is not. The alternative, a
+# locally-managed tunnel with a credentials file and a rendered config, puts the
+# ingress in version control at the cost of a second secret and a config file to
+# keep in step. Both are legitimate; this is the one that was chosen, and the
+# missing half is the routing, not the credential.
 zabbix_server_enable_cloudflared: false
+# ⚠ PINNED, and deliberately unlike the reference compose this was modelled on,
+# which uses `:latest`. An unpinned connector makes the running version a
+# function of when the image was last pulled.
 zabbix_server_cloudflared_image: "cloudflare/cloudflared:2026.7.3"
-# UUID of a tunnel created out of band, and the public hostname routed to it.
-zabbix_server_cloudflared_tunnel_id: ""
-zabbix_server_cloudflared_hostname: ""
-# The tunnel's credentials JSON, verbatim. Secret -- vault or SOPS.
-zabbix_server_cloudflared_credentials: ""
-# ⚠ cloudflared reaches the frontend over the Compose network, NOT through
-# Traefik. Cloudflare terminates TLS at its own edge, so routing it through
-# Traefik would demand a second certificate for the public name -- obtained by
-# DNS-01 for a hostname whose whole purpose is being reachable without the LAN.
+# The tunnel token from the dashboard. It is the WHOLE credential -- it encodes
+# the account, the tunnel id and its secret -- so treat it exactly like a
+# password: vault or SOPS, never a default here.
+zabbix_server_cloudflared_tunnel_token: ""
+# Bound so `cloudflared tunnel ready` has a fixed address to query; without it
+# the metrics server picks a port nothing can then ask. See the healthcheck.
 zabbix_server_cloudflared_metrics_port: 2000
 
 # ── Locale and identity (upstream defaults are rarely what you want) ─────────

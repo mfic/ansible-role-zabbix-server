@@ -229,6 +229,19 @@ services:
   {% if zabbix_server_enable_cloudflared | bool %}
   # Outbound-only: the tunnel dials the Cloudflare edge, so nothing inbound is
   # opened on this host or its firewall for the public path.
+  #
+  # ⚠ ON THE COMPOSE NETWORK, not `network_mode: host`. The reference compose
+  # this was modelled on uses host networking, which is right for a connector
+  # that fronts arbitrary things on the host — but here it would mean reaching
+  # the frontend through its 127.0.0.1 publish, and that publish is the
+  # BREAK-GLASS path. Coupling the public route to the emergency route means one
+  # change can take both away. On the bridge network the two stay independent.
+  #
+  # ⚠ CONSEQUENCE FOR THE DASHBOARD: the tunnel's public hostname must point at
+  # `http://zabbix-web:8080`, resolved by Docker on this network — NOT at
+  # localhost. A dashboard entry pointing at 127.0.0.1 reaches the CONTAINER's
+  # own loopback, where nothing is listening, and every request 502s while the
+  # tunnel itself reports perfectly healthy.
   cloudflared:
     image: {{ zabbix_server_cloudflared_image }}
     container_name: zabbix-cloudflared
@@ -236,14 +249,19 @@ services:
     depends_on:
       zabbix-web:
         condition: service_started
-    # The image's entrypoint is already `cloudflared --no-autoupdate`, so this
-    # appends to it rather than repeating either. Pinning the tag is what fixes
-    # the version; a binary that replaces itself in place would make the running
-    # version a function of uptime rather than of this file.
-    command: tunnel --config /etc/cloudflared/config.yaml run
-    volumes:
-      - {{ zabbix_server_data_dir }}/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
-      - {{ zabbix_server_data_dir }}/cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
+    # Token-configured, so there is no config file and no credentials file to
+    # mount -- the connector fetches its ingress rules from Cloudflare. The
+    # image's entrypoint is already `cloudflared --no-autoupdate`, so this
+    # appends to it rather than repeating it.
+    #
+    # ⚠ --metrics is a TUNNEL command option and must sit between `tunnel` and
+    # `run`. It is not decoration: the healthcheck below queries this address,
+    # and left unset the metrics server binds a port nothing can find.
+    command: tunnel --metrics 0.0.0.0:{{ zabbix_server_cloudflared_metrics_port }} run
+    environment:
+      # The whole credential -- account, tunnel id and secret in one string.
+      # Lives in .env at 0600, not here, so the compose file stays diffable.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?TUNNEL_TOKEN is unset — refusing to start}
     # `ready` reports the state of the connections to the edge, so this is a
     # healthcheck of the TUNNEL and not merely of the process. A cloudflared
     # that is running but has no registered connection serves nothing while

@@ -93,16 +93,26 @@ database, in order to route one fixed backend already known when the file is ren
 > provider has never heard of, and the propagation check then asks a server that answers NXDOMAIN
 > with full authority. It never succeeds — and it fails looking exactly like a bad API token.
 
-**`zabbix_server_enable_cloudflared`** — outbound-only tunnel to the Cloudflare edge, **locally
-managed**: the ingress rules are rendered from role variables, so a rebuild reproduces the routing.
-A token-configured ("remotely managed") tunnel keeps them in the Cloudflare dashboard, where they
-are neither in a diff nor restored by this role. It reaches the frontend **directly over the Compose
-network, not through Traefik** — Cloudflare terminates TLS at its own edge, so the Traefik path
-would demand a second certificate for a name whose whole purpose is being reachable without the LAN.
+**`zabbix_server_enable_cloudflared`** — outbound-only tunnel to the Cloudflare edge,
+**token-configured** ("remotely managed"). One secret, `zabbix_server_cloudflared_tunnel_token`; no
+config file and no credentials file. It reaches the frontend **directly over the Compose network,
+not through Traefik** — Cloudflare terminates TLS at its own edge, so the Traefik path would demand
+a second certificate for a name whose whole purpose is being reachable without the LAN.
 
-> ⚠ The cloudflared image runs as **uid 65532**, unlike every other container here. Its credentials
-> file is owned by that uid; root-owned `0600` produces a container that starts, cannot read its own
-> credentials, and retries forever while the tunnel never registers.
+> ⚠ **The routing is not in this repo.** A token-configured tunnel keeps its ingress rules in the
+> Cloudflare dashboard, so a rebuild from source restores a connector that serves whatever the
+> dashboard says. The credential is reproducible; the routing is not. A locally-managed tunnel
+> (credentials file + rendered config) is the trade in the other direction — ingress in version
+> control, at the cost of a second secret and a config to keep in step.
+
+> ⚠ **The dashboard's public hostname must point at `http://zabbix-web:8080`**, resolved by Docker
+> on the Compose network — *not* at localhost. Pointing it at `127.0.0.1` reaches the connector
+> container's own loopback, where nothing listens: every request 502s while the tunnel reports
+> perfectly healthy.
+
+The connector runs on the Compose network rather than `network_mode: host` deliberately. Host
+networking would reach the frontend through its `127.0.0.1` publish — the break-glass path — and
+coupling the public route to the emergency route means one change can remove both.
 
 The role verifies the certificate Traefik actually serves, rather than that it is listening. Until
 DNS-01 completes, Traefik answers with its own `TRAEFIK DEFAULT CERT` — a working HTTPS endpoint
