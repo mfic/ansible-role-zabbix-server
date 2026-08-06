@@ -60,11 +60,66 @@ zabbix_server_db_expect_existing: true
 # SERVER, never a proxy. Guards a heartbeat that a proxy would keep answering.
 zabbix_server_assert_monitored_by_server: true
 
-# ── Housekeeping ─────────────────────────────────────────────────────────────
-# ⚠ Both overrides must be enabled or the housekeeper removes nothing.
-zabbix_server_housekeeping_override_history: true
-zabbix_server_housekeeping_override_trends: true
+# ── Housekeeping and retention ───────────────────────────────────────────────
+# Server-managed housekeeping. Partition-based housekeeping (dropping chunks
+# instead of row-by-row DELETE) is a TimescaleDB feature, and TimescaleDB is off
+# above; pg_partman against Zabbix's schema is not a supported configuration.
+#
+# ⚠ BOTH OVERRIDES MUST STAY FALSE, and this is the correction most likely to be
+# undone by someone reading the documentation quickly. The requirement that
+# "Override item history period" and "Override item trend period" both be
+# ENABLED for the housekeeper to delete anything is TIMESCALEDB-SPECIFIC -- it
+# appears only in the TimescaleDB appendix. Generalised to plain PostgreSQL it is
+# wrong: the housekeeper deletes perfectly well with them off.
+#
+# What OFF buys is PER-ITEM retention, which is Zabbix's native behaviour. These
+# two settings are GLOBAL, so turning either one on collapses every item in the
+# estate onto the single period below and silently discards any longer per-item
+# retention configured on templates. Nothing errors; the data just stops being
+# there.
+zabbix_server_housekeeping_override_history: false
+zabbix_server_housekeeping_override_trends: false
+
+# Upstream defaults, deliberately. The documentation gives no housekeeper tuning
+# formula for a given host or metric count, so changing these without a measured
+# problem is guessing. Monitor instead -- see the cache note below.
+zabbix_server_housekeeping_frequency: 1        # hours
+zabbix_server_max_housekeeper_delete: 5000
+
 # History dominates trends on disk by roughly 100x (90 vs 8 bytes per value), so
 # short history with long trends is usually the right shape for capacity data.
+# Worked example, ~4,000 items at a ~2-minute average interval: 31d of history is
+# ~8 GB, while *two years* of trends is ~560 MB. Capacity forecasting reads
+# trends, so be generous there and deliberate with history.
+#
+# 31d rather than 30d so the whole of the previous calendar month is always
+# present. 730d rather than 365d because year-over-year comparison needs strictly
+# more than a year of data to exist at all.
 zabbix_server_history_retention: "31d"
 zabbix_server_trends_retention: "730d"
+
+# ⚠ A PER-ITEM value, not a global -- applied to template items by the consuming
+# inventory, and only meaningful while both overrides above are false.
+#
+# Availability items (ICMP ping/loss/response time, net.tcp.service port checks,
+# agent availability) are the case where hourly averaging is genuinely lossy:
+# "unreachable for 40 minutes from 03:12" survives in raw history and is
+# destroyed by trends, which render it as one hour at 0.67. Disk-space items are
+# the opposite -- hourly min/avg/max is exactly what a growth forecast reads, so
+# they gain nothing from long raw retention and cost ~100x more to keep.
+#
+# ⚠ Re-importing or upgrading an official Zabbix template can RESET customised
+# item history periods. This is not set-and-forget; re-check after template
+# updates.
+zabbix_server_availability_history_retention: "365d"
+
+# ── Caches ───────────────────────────────────────────────────────────────────
+# Upstream defaults, and that is a deliberate choice rather than an omission.
+# The documentation gives no cache-sizing formula for a given host or metric
+# count, so raising these to fill available RAM is guessing -- and an oversized
+# cache hides its own wrongness, because the real working set never becomes
+# visible. Add the internal items instead and let the server say which cache is
+# actually tight:
+#   zabbix[process,housekeeper,avg,busy]
+#   zabbix[rcache,buffer,pfree]  and the vcache / trend / history equivalents
+zabbix_server_cache_sizes: {}                  # {} = ship upstream defaults
