@@ -51,6 +51,11 @@ zabbix_server_web_port: 8080
 # ── Database ─────────────────────────────────────────────────────────────────
 zabbix_server_db_engine: postgresql
 zabbix_server_db_image: "postgres:16-alpine"
+# Container names are fixed in the compose template so that operators (and the
+# nightly pg_dump) can address them without going through `docker compose ps`.
+# Named here as well so the role's own tasks reference the same string the
+# template writes, rather than repeating a literal.
+zabbix_server_db_container_name: zabbix-postgres
 zabbix_server_db_name: zabbix
 zabbix_server_db_user: zabbix
 # No default, deliberately: a default password for a database that is about to

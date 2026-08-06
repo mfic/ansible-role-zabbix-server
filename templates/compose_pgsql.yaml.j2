@@ -22,7 +22,7 @@
 services:
   postgres:
     image: {{ zabbix_server_db_image }}
-    container_name: zabbix-postgres
+    container_name: {{ zabbix_server_db_container_name }}
     restart: {{ zabbix_server_restart_policy }}
     # ⚠ The bind target is /var/lib/postgresql/data, NOT /var/lib/postgresql.
     # Mounting the parent leaves the real data directory inside an ANONYMOUS

@@ -85,7 +85,6 @@
     group: root
     mode: "0600"
   no_log: true
-  notify: Restart zabbix stack
 
 - name: Render the compose file
   ansible.builtin.template:
@@ -107,7 +106,6 @@
     # invites someone to weaken the `:?` guard that exists to stop PostgreSQL
     # starting with no password.
     validate: "docker compose --env-file {{ zabbix_server_compose_dir }}/.env -f %s config --quiet"
-  notify: Restart zabbix stack
 
 - name: Bring the stack up
   community.docker.docker_compose_v2:
@@ -120,6 +118,42 @@
     wait: true
     wait_timeout: 300
   register: _zbx_compose
+
+- name: Wait for the Zabbix schema to be seeded
+  # ⚠ Creating the schema and SEEDING it are two different things, and only the
+  # second one is checked here. `users` is the table zabbix-server itself tests
+  # at startup: 203 tables with an empty `users` is a database that looks
+  # complete to every other check and makes the server crash-loop on
+  #   cannot use database "zabbix": its "users" table is empty
+  #
+  # On a first build the seed takes a minute or more, and anything that
+  # interrupts it -- a restart, a timeout, an operator with Ctrl-C -- leaves
+  # exactly that state. Waiting here means the run either observes a seeded
+  # database or fails saying so, instead of continuing on to checks that a
+  # half-built schema happens to satisfy.
+  community.docker.docker_container_exec:
+    container: "{{ zabbix_server_db_container_name }}"
+    command: >-
+      psql -U {{ zabbix_server_db_user }} -d {{ zabbix_server_db_name }}
+      -tAc "select count(*) from users"
+  register: _zbx_seeded
+  until: (_zbx_seeded.stdout | default('0') | trim | int) > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+- name: Fail when the database never finished seeding
+  ansible.builtin.fail:
+    msg: >-
+      The Zabbix schema in "{{ zabbix_server_db_name }}" has no rows in `users`
+      after 10 minutes, so it was created but never seeded -- almost always
+      because something restarted the stack while zabbix-server was still
+      building it. zabbix-server will crash-loop indefinitely in this state.
+      Recovery is to drop and recreate the schema and let the stack come up
+      undisturbed; nothing else will repair it, because every retry sees the
+      tables already present and skips creation.
+  when: (_zbx_seeded.stdout | default('0') | trim | int) <= 0
 
 - name: Wait for the server to accept connections on the trapper port
   # The zabbix-server image ships no healthcheck, so this is verified from the

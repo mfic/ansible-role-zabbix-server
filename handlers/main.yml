@@ -1,11 +1,30 @@
 ---
-- name: Restart zabbix stack
-  # `restarted` recreates the containers whose definition changed and leaves the
-  # rest alone. It does not remove volumes — and since every persistent path
-  # here is a bind mount to a real directory, there is no volume to lose in the
-  # first place. That is the payoff of having rejected named volumes.
-  community.docker.docker_compose_v2:
-    project_src: "{{ zabbix_server_compose_dir }}"
-    state: restarted
-    wait: true
-    wait_timeout: 300
+# ⚠ DELIBERATELY EMPTY. There used to be a "Restart zabbix stack" handler here,
+# notified by the .env and compose.yaml template tasks. It was redundant and, on
+# a first build, destructive.
+#
+# Redundant, because `Bring the stack up` already runs
+# community.docker.docker_compose_v2 with state: present -- which is
+# `docker compose up -d`, and that recreates exactly the containers whose
+# resolved configuration changed. Rendering a new compose file or a new .env
+# changes that configuration, so the recreation the handler existed to force had
+# already happened by the time it ran.
+#
+# Destructive, because handlers run AFTER the tasks that notified them. On a
+# first build the sequence was: bring the stack up -> zabbix-server begins
+# creating and seeding the Zabbix schema, which takes a minute or more ->
+# handler fires -> every container is restarted mid-seed. PostgreSQL logs
+#
+#   FATAL:  terminating connection due to administrator command
+#
+# and what survives is 203 tables with no rows in them. The server then
+# crash-loops forever on
+#
+#   cannot use database "zabbix": its "users" table is empty
+#
+# which points at the database rather than at the restart that truncated it.
+# Recovery is a schema drop. Found standing the first real deployment
+# (ansible-infra ticket 010).
+#
+# If a genuine restart-on-change is ever needed, it must wait for the seed to
+# finish first -- not simply be reinstated.
