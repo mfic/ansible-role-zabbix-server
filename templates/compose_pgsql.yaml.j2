@@ -125,6 +125,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # ⚠ ORDERING AGAINST THE SERVER, not just the database, and dropping it
+      # breaks the very first build. Both images will create the Zabbix schema
+      # in an empty database, so starting them together races: one runs the DDL
+      # while the other is midway through, the 203 tables end up present, the
+      # seed data does not, and zabbix-server then crash-loops on
+      #   cannot use database "zabbix": its "users" table is empty
+      #     (is this the Zabbix proxy database?)
+      # which names neither the real cause nor this container.
+      #
+      # Recovering costs a schema drop, so the ordering is what makes a first
+      # build repeatable at all. Upstream's compose_pgsql.yaml carries this
+      # dependency; it was lost when this file was rewritten from it.
+      #
+      # service_started, not service_healthy: the zabbix-server image ships no
+      # healthcheck, so service_healthy would wait forever.
+      zabbix-server:
+        condition: service_started
     environment:
       DB_SERVER_HOST: postgres
       DB_SERVER_PORT: "5432"
