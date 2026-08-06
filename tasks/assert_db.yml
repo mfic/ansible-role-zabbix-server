@@ -31,20 +31,36 @@
     - zabbix_server_db_expect_existing | bool
     - not _zbx_pgdata.stat.exists
 
-- name: Assert the data directory is a real mount, not a path inside the container layer
-  # The second silent route: mounting /var/lib/postgresql instead of
-  # /var/lib/postgresql/data creates an ANONYMOUS volume that disappears on the
-  # next `up --force-recreate`. The bind must resolve to a real device.
+- name: Find the mount point backing the data directory
+  # `--target` walks UP to the nearest mount point, so this answers "which
+  # filesystem would a write here land on" rather than "is this path itself a
+  # mount". That distinction is the whole check: a data directory that resolves
+  # to / is a directory on the root filesystem wearing the right name.
   ansible.builtin.command:
-    cmd: "findmnt --target {{ zabbix_server_data_dir }} --noheadings --output SOURCE"
+    cmd: "findmnt --target {{ zabbix_server_data_dir }} --noheadings --output TARGET,SOURCE"
   register: _zbx_mount
   changed_when: false
   failed_when: false
 
-- name: Warn when the data directory is not on its own mount
-  ansible.builtin.debug:
+- name: Fail when the data directory is not its own filesystem
+  # This is an assertion rather than a warning, and the difference is the point.
+  # A warning printed on every run is a warning nobody reads — and the thing it
+  # would have caught (a dedicated disk that failed to mount, so PostgreSQL
+  # writes to root instead) looks EXACTLY like a healthy deployment until the
+  # disk is needed. With the data on a dedicated device, "did the mount happen"
+  # is a yes/no question, so ask it as one.
+  ansible.builtin.fail:
     msg: >-
-      WARNING: {{ zabbix_server_data_dir }} does not resolve to a dedicated
-      mount ({{ _zbx_mount.stdout | default('unresolved') }}). Confirm this is
-      the intended durable storage and not the root filesystem.
-  when: _zbx_mount.rc != 0 or _zbx_mount.stdout | trim == ''
+      REFUSING TO START. {{ zabbix_server_data_dir }} is not its own
+      filesystem — it resolves to
+      "{{ _zbx_mount.stdout | trim | default('nothing', true) }}". The dedicated
+      data disk is missing, unmounted, or mounted somewhere else, so PostgreSQL
+      would write the estate's monitoring history to the root filesystem, where
+      nothing about it looks wrong until the disk fills or the VM is rebuilt.
+      Mount the data device at {{ zabbix_server_data_dir }} and re-run. If this
+      deployment genuinely keeps its data on root, set
+      zabbix_server_assert_data_dir_is_mount=false and accept that the
+      PG_VERSION check above is then the only guard left.
+  when:
+    - zabbix_server_assert_data_dir_is_mount | bool
+    - _zbx_mount.rc != 0 or (_zbx_mount.stdout.split() | first | default('')) != zabbix_server_data_dir

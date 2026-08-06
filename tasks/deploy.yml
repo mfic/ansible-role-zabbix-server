@@ -1,0 +1,134 @@
+---
+# Render the Compose project and bring it up.
+#
+# Rendered, never checked out. The upstream upgrade procedure is `git pull` on
+# zabbix/zabbix-docker followed by `up -d`; the upstream docs themselves warn
+# that this overwrites local edits, and it carries no database backup and no
+# rollback. Here the compose file is a function of this role's variables, so an
+# upgrade is a version bump plus a diff someone can read before it runs.
+
+- name: Assert a database password was supplied
+  # Checked before anything is created: an empty password reaches the postgres
+  # image as POSTGRES_PASSWORD="" and it refuses to initialise -- but only after
+  # the directories, the compose file and a half-built project already exist.
+  ansible.builtin.assert:
+    that:
+      - zabbix_server_db_password | length > 0
+    fail_msg: >-
+      zabbix_server_db_password is empty. The role ships no default on purpose:
+      supply it from vault or SOPS in the consuming inventory.
+    quiet: true
+
+- name: Verify the docker service is enabled
+  # The stack's restart policy is the ONLY thing bringing Zabbix back after an
+  # unplanned reboot -- there is no systemd unit for the stack itself. If
+  # docker.service is not enabled, the policy never gets a chance to act, and
+  # the failure mode is a monitoring server that stays down after exactly the
+  # event it exists to report.
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Create the compose project directory
+  ansible.builtin.file:
+    path: "{{ zabbix_server_compose_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create the persistent data directories
+  ansible.builtin.file:
+    path: "{{ zabbix_server_data_dir }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    # PostgreSQL refuses to start on a data directory with group or world
+    # permissions, so 0700 is the image's requirement, not a preference.
+    - path: postgresql/data
+      owner: "{{ zabbix_server_db_uid }}"
+      group: "{{ zabbix_server_db_gid }}"
+      mode: "0700"
+    - path: alertscripts
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+    - path: externalscripts
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+    - path: export
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+    - path: ssl/certs
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+    - path: ssl/keys
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+      mode: "0700"
+    - path: ssl/ssl_ca
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+    - path: snmptraps
+      owner: "{{ zabbix_server_uid }}"
+      group: "{{ zabbix_server_gid }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Render the database credentials
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ zabbix_server_compose_dir }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart zabbix stack
+
+- name: Render the compose file
+  ansible.builtin.template:
+    src: compose_pgsql.yaml.j2
+    dest: "{{ zabbix_server_compose_dir }}/compose.yaml"
+    owner: root
+    group: root
+    mode: "0640"
+    # A compose file that does not parse takes the stack down on the next `up`,
+    # so validate before replacing the working one.
+    validate: "docker compose -f %s config --quiet"
+  notify: Restart zabbix stack
+
+- name: Bring the stack up
+  community.docker.docker_compose_v2:
+    project_src: "{{ zabbix_server_compose_dir }}"
+    state: present
+    # Pull only what is missing: the tags are pinned, so a pull-always would
+    # re-fetch identical layers on every run and, worse, would silently move
+    # the deployment if a tag were ever repointed upstream.
+    pull: missing
+    wait: true
+    wait_timeout: 300
+  register: _zbx_compose
+
+- name: Wait for the server to accept connections on the trapper port
+  # The zabbix-server image ships no healthcheck, so this is verified from the
+  # outside rather than trusting `docker compose up` to have meant anything.
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 10051
+    timeout: 180
+
+- name: Wait for the frontend to answer
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ zabbix_server_web_port }}/ping"
+    return_content: true
+  register: _zbx_ping
+  until: _zbx_ping.status == 200
+  retries: 30
+  delay: 5
+  changed_when: false
+  # ⚠ A 200 from /ping proves the frontend and its database connection are
+  # alive. It does NOT prove the database is the right one -- a freshly
+  # initialised empty Zabbix answers this identically. That is what the
+  # pre-flight guard in assert_db.yml is for; this check is liveness only.

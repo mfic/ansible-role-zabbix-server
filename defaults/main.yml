@@ -15,9 +15,48 @@ zabbix_server_compose_ref: "7.0"          # branch of zabbix/zabbix-docker
 zabbix_server_compose_dir: /opt/zabbix
 zabbix_server_data_dir: /opt/zabbix/data
 
+# ── Persistent storage ───────────────────────────────────────────────────────
+# EVERY persistent path is an explicit BIND MOUNT under zabbix_server_data_dir.
+# Named volumes were rejected deliberately: they live under Docker's data-root,
+# so the path holding the database is neither visible to `ls` nor checkable by
+# `findmnt`, and a rebuild that loses one recreates it EMPTY and green.
+#
+# zabbix_server_data_dir is expected to be its OWN filesystem -- a dedicated
+# disk, not a directory on root. That is what turns the pre-flight mount check
+# from advisory into load-bearing: a bind that silently landed on the root
+# filesystem becomes distinguishable from a correct one. Set this false only for
+# a deployment that deliberately keeps the data on root, and accept that the
+# guard weakens to the PG_VERSION check alone.
+zabbix_server_assert_data_dir_is_mount: true
+
+# Image facts, not site choices -- variables because an image flavour change
+# moves them. The Zabbix images run as uid/gid 1997 (`zabbix`); the alpine
+# postgres image runs as uid/gid 70.
+zabbix_server_uid: 1997
+zabbix_server_gid: 1997
+zabbix_server_db_uid: 70
+zabbix_server_db_gid: 70
+
+# ── Networking ───────────────────────────────────────────────────────────────
+# Agents and future proxies connect here, so it is published on all interfaces.
+zabbix_server_listen_address: "0.0.0.0"
+
+# ⚠ The frontend is bound to LOOPBACK by default. How it is reached and how
+# humans authenticate is a separate decision; until one is taken, the safe
+# default is a port nothing off-host can open. A consuming inventory that has
+# decided (reverse proxy, tunnel, direct) overrides this.
+zabbix_server_web_listen_address: "127.0.0.1"
+zabbix_server_web_port: 8080
+
 # ── Database ─────────────────────────────────────────────────────────────────
 zabbix_server_db_engine: postgresql
 zabbix_server_db_image: "postgres:16-alpine"
+zabbix_server_db_name: zabbix
+zabbix_server_db_user: zabbix
+# No default, deliberately: a default password for a database that is about to
+# hold the estate's monitoring history is worse than a failed run. The
+# consuming inventory supplies it from vault or SOPS.
+zabbix_server_db_password: ""
 
 # TimescaleDB is off by default, and that default is load-bearing:
 # ENABLE_TIMESCALEDB acts only at SCHEMA-CREATION time, so it cannot be switched
@@ -37,6 +76,15 @@ zabbix_server_db_shm_size: 256m
 # ⚠ Upstream ships 1m, against an image whose own Dockerfile warns that even 90s
 # may not suffice (STOPSIGNAL SIGINT = fast shutdown).
 zabbix_server_db_stop_grace_period: 120s
+
+# ── Lifecycle ────────────────────────────────────────────────────────────────
+# `unless-stopped`, not `always`: both survive a reboot or a daemon restart, so
+# the stack comes back on its own after a hypervisor HA restart with nobody at
+# the keyboard. The difference is that `always` also restarts a container an
+# operator stopped on purpose, which fights maintenance. Docker's own policy is
+# the mechanism -- no systemd unit -- but it only works if the docker service
+# itself is enabled, which the role verifies.
+zabbix_server_restart_policy: unless-stopped
 
 # ── Services ─────────────────────────────────────────────────────────────────
 # The upstream .env_srv ships both of these TRUE, so a default install starts
@@ -123,3 +171,9 @@ zabbix_server_availability_history_retention: "365d"
 #   zabbix[process,housekeeper,avg,busy]
 #   zabbix[rcache,buffer,pfree]  and the vcache / trend / history equivalents
 zabbix_server_cache_sizes: {}                  # {} = ship upstream defaults
+
+# Escape hatch for ZBX_* settings this role does not model. Rendered verbatim
+# into the server's environment. Kept last so it can override anything above --
+# and deliberately awkward to reach for, because a setting that matters belongs
+# in a named variable with the reasoning attached, not in an opaque dict.
+zabbix_server_extra_env: {}

@@ -1,5 +1,11 @@
 ---
-# Handlers, to be filled in with the deployment tasks.
-- name: restart zabbix stack
-  ansible.builtin.debug:
-    msg: TODO
+- name: Restart zabbix stack
+  # `restarted` recreates the containers whose definition changed and leaves the
+  # rest alone. It does not remove volumes — and since every persistent path
+  # here is a bind mount to a real directory, there is no volume to lose in the
+  # first place. That is the payoff of having rejected named volumes.
+  community.docker.docker_compose_v2:
+    project_src: "{{ zabbix_server_compose_dir }}"
+    state: restarted
+    wait: true
+    wait_timeout: 300

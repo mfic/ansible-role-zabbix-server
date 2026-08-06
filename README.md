@@ -2,8 +2,8 @@
 
 Deploys the **Zabbix 7.0 LTS server** as a Docker Compose stack on Debian.
 
-**Status: skeleton.** The interface and the two safety assertions below are settled; the deployment
-tasks are still to be filled in.
+**Status: deploys.** The compose stack, the volume layout and both safety assertions are
+implemented. Not yet run against a real host.
 
 ## Design
 
@@ -52,9 +52,47 @@ switch that simply never alerts.
 unset `shm_size`, a `stop_grace_period` shorter than the database image's own guidance, and two
 optional components that ship enabled. Each is commented in place.
 
+## Storage: bind mounts, on a filesystem of their own
+
+Upstream's compose file uses **named volumes**. This role uses **explicit bind mounts** under
+`zabbix_server_data_dir`, and the reason is assertion #1 above. A named volume lives under Docker's
+data-root: the path holding the database is not visible to `ls`, not checkable by `findmnt`, and a
+rebuild that loses the volume recreates it *empty* — which is exactly the failure that comes up
+green. A bind mount is a directory. You can look at it, a backup job that is not Docker can read it,
+and the pre-flight guard can `stat` the `PG_VERSION` inside it.
+
+`zabbix_server_data_dir` is expected to be **its own filesystem**, and the role fails when it is not
+(`zabbix_server_assert_data_dir_is_mount`). That check is only worth having *because* the data is on
+a dedicated device: it turns "did the data disk mount?" into a yes/no question asked before
+PostgreSQL starts. Without it, an unmounted disk means the database quietly writes to root and
+nothing looks wrong until the disk fills or the machine is rebuilt.
+
+Deployments that genuinely keep their data on root can set that variable `false` — the `PG_VERSION`
+check is then the only guard left, and that is a real reduction in cover, not a formality.
+
+## What this role does *not* configure
+
+**Retention, and the two housekeeping override flags.** They are frontend settings stored in the
+database, not `ZBX_*` environment variables, so no compose file can express them. They are applied
+over the API after the stack is up. `defaults/main.yml` carries the *values* and the reasoning
+(notably that both overrides must stay `false` on plain PostgreSQL), but a consuming playbook has to
+apply them — assuming the compose file did is how a documented retention policy ends up never
+actually in force.
+
+## Requirements
+
+- Docker Engine with the Compose v2 plugin on the target, and `docker.service` **enabled** — the
+  stack's `restart: unless-stopped` policy is the only thing that brings Zabbix back after an
+  unplanned reboot, and it cannot act if the daemon does not start.
+- `community.docker` on the controller.
+- `community.zabbix` on the controller, for the post-flight API assertion.
+
 ## Role variables
 
-See `defaults/main.yml`.
+See `defaults/main.yml`. Two have no usable default and must come from the consuming inventory:
+`zabbix_server_db_password` (the role ships none on purpose) and, in practice,
+`zabbix_server_php_tz` / `zabbix_server_name`, whose upstream defaults are `Europe/Riga` and
+`Composed installation`.
 
 ## Licence
 

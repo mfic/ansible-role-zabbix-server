@@ -1,0 +1,177 @@
+#jinja2: trim_blocks: True, lstrip_blocks: True
+# {{ ansible_managed }}
+#
+# Rendered by mfic.zabbix_server. DO NOT EDIT ON THE HOST — the next run
+# overwrites it.
+#
+# Modelled on zabbix/zabbix-docker `compose_pgsql.yaml` (branch
+# {{ zabbix_server_compose_ref }}), rendered rather than checked out: the upstream upgrade
+# procedure is `git pull` + `up -d`, which overwrites local edits and offers no
+# rollback. Rendering makes the file a function of this role's variables, so an
+# upgrade is a version bump in the inventory and a diff you can read first.
+#
+# ⚠ EVERY PERSISTENT PATH IS AN EXPLICIT BIND MOUNT under
+# {{ zabbix_server_data_dir }}, which is its own filesystem. Upstream uses named
+# volumes; that was rejected deliberately. A named volume lives under Docker's
+# data-root, so a rebuild that loses the volume — or a data-root that quietly
+# moved — recreates it EMPTY, PostgreSQL initialises a fresh cluster, Zabbix
+# rebuilds its schema, and the whole stack comes up green with no history. Bind
+# mounts make the path visible to `ls`, checkable by `findmnt`, and readable by
+# a backup job that is not Docker.
+
+services:
+  postgres:
+    image: {{ zabbix_server_db_image }}
+    container_name: zabbix-postgres
+    restart: {{ zabbix_server_restart_policy }}
+    # ⚠ The bind target is /var/lib/postgresql/data, NOT /var/lib/postgresql.
+    # Mounting the parent leaves the real data directory inside an ANONYMOUS
+    # volume that disappears on the next `up --force-recreate` — the second
+    # silent route to an empty database.
+    volumes:
+      - {{ zabbix_server_data_dir }}/postgresql/data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: {{ zabbix_server_db_user }}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is unset — refusing to start}
+      POSTGRES_DB: {{ zabbix_server_db_name }}
+      # Belt and braces against the mount landing one level too high: if the
+      # bind is wrong, initdb writes here and PG_VERSION is absent from the
+      # path the pre-flight guard stats, so the NEXT run refuses.
+      PGDATA: /var/lib/postgresql/data
+    # Upstream sets no shm_size at all, leaving Docker's 64 MB default. Parallel
+    # query workers and large sorts allocate there and fail when it is short.
+    shm_size: {{ zabbix_server_db_shm_size }}
+    # Upstream ships 1m. The postgres image's STOPSIGNAL is SIGINT (fast
+    # shutdown); a hard kill mid-checkpoint is the other silent-corruption
+    # route, and the image's own guidance warns 90s may not be enough.
+    stop_grace_period: {{ zabbix_server_db_stop_grace_period }}
+    # pg_isready ships in this image, so this healthcheck is verified rather
+    # than assumed — which matters because zabbix-server gates on it below.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U {{ zabbix_server_db_user }} -d {{ zabbix_server_db_name }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - zabbix
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:{{ zabbix_server_image_flavour }}-{{ zabbix_server_version }}
+    container_name: zabbix-server
+    restart: {{ zabbix_server_restart_policy }}
+    # service_healthy, not service_started: the server's entrypoint creates the
+    # schema, and racing initdb is how a half-built database happens.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: "5432"
+      POSTGRES_USER: {{ zabbix_server_db_user }}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is unset — refusing to start}
+      POSTGRES_DB: {{ zabbix_server_db_name }}
+      # Upstream default is "Composed installation" — it is what the frontend
+      # header and every email subject line says.
+      ZBX_SERVER_NAME: "{{ zabbix_server_name }}"
+      ZBX_ENABLE_SNMP_TRAPS: "{{ zabbix_server_enable_snmp_traps | bool | lower }}"
+      ZBX_JAVAGATEWAY_ENABLE: "{{ zabbix_server_enable_java_gateway | bool | lower }}"
+      {% if zabbix_server_enable_java_gateway | bool %}
+      ZBX_JAVAGATEWAY: zabbix-java-gateway
+      {% endif %}
+      ZBX_HOUSEKEEPINGFREQUENCY: "{{ zabbix_server_housekeeping_frequency }}"
+      ZBX_MAXHOUSEKEEPERDELETE: "{{ zabbix_server_max_housekeeper_delete }}"
+      {% if zabbix_server_cache_sizes %}
+      # Set only when the inventory has a MEASURED reason to override. Empty by
+      # default: there is no documented sizing formula, and an oversized cache
+      # hides its own wrongness because the real working set never shows.
+      {% for key, value in zabbix_server_cache_sizes | dictsort %}
+      {{ key }}: "{{ value }}"
+      {% endfor %}
+      {% endif %}
+      {% for key, value in zabbix_server_extra_env | dictsort %}
+      {{ key }}: "{{ value }}"
+      {% endfor %}
+    # ⚠ Retention (history/trends) and the two housekeeping OVERRIDE flags are
+    # NOT settable here. They live in the database as frontend settings, so they
+    # are applied over the API after the stack is up — see the role's README.
+    # There is no env var that can express them, and assuming otherwise is how
+    # a documented retention policy ends up never actually applied.
+    ports:
+      - "{{ zabbix_server_listen_address }}:10051:10051"
+    volumes:
+      - {{ zabbix_server_data_dir }}/alertscripts:/usr/lib/zabbix/alertscripts:ro
+      - {{ zabbix_server_data_dir }}/externalscripts:/usr/lib/zabbix/externalscripts:ro
+      - {{ zabbix_server_data_dir }}/export:/var/lib/zabbix/export
+      - {{ zabbix_server_data_dir }}/ssl/certs:/var/lib/zabbix/ssl/certs:ro
+      - {{ zabbix_server_data_dir }}/ssl/keys:/var/lib/zabbix/ssl/keys:ro
+      - {{ zabbix_server_data_dir }}/ssl/ssl_ca:/var/lib/zabbix/ssl/ssl_ca:ro
+      {% if zabbix_server_enable_snmp_traps | bool %}
+      - {{ zabbix_server_data_dir }}/snmptraps:/var/lib/zabbix/snmptraps:ro
+      {% endif %}
+    stop_grace_period: 30s
+    sysctls:
+      # fping runs setuid-less in this image and needs unprivileged ICMP.
+      # Without it every ICMP check reports the host down — the same failure
+      # that bites the Hetzner proxy (D16).
+      - net.ipv4.ping_group_range=0 1995
+    networks:
+      - zabbix
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:{{ zabbix_server_image_flavour }}-{{ zabbix_server_version }}
+    container_name: zabbix-web
+    restart: {{ zabbix_server_restart_policy }}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: "5432"
+      POSTGRES_USER: {{ zabbix_server_db_user }}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is unset — refusing to start}
+      POSTGRES_DB: {{ zabbix_server_db_name }}
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_PORT: "10051"
+      ZBX_SERVER_NAME: "{{ zabbix_server_name }}"
+      # Upstream default is Europe/Riga. It decides every timestamp a human
+      # reads in the UI and every one quoted in an alert.
+      PHP_TZ: "{{ zabbix_server_php_tz }}"
+    # ⚠ Bound to {{ zabbix_server_web_listen_address }} by default, i.e. NOT
+    # published to the network. How the frontend is reached and how humans
+    # authenticate is a separate decision; until it is taken, the safe default
+    # is a port only reachable from the host itself.
+    ports:
+      - "{{ zabbix_server_web_listen_address }}:{{ zabbix_server_web_port }}:8080"
+    stop_grace_period: 30s
+    networks:
+      - zabbix
+
+  {% if zabbix_server_enable_java_gateway | bool %}
+  zabbix-java-gateway:
+    image: zabbix/zabbix-java-gateway:{{ zabbix_server_image_flavour }}-{{ zabbix_server_version }}
+    container_name: zabbix-java-gateway
+    restart: {{ zabbix_server_restart_policy }}
+    stop_grace_period: 5s
+    networks:
+      - zabbix
+
+  {% endif %}
+  {% if zabbix_server_enable_snmp_traps | bool %}
+  zabbix-snmptraps:
+    image: zabbix/zabbix-snmptraps:{{ zabbix_server_image_flavour }}-{{ zabbix_server_version }}
+    container_name: zabbix-snmptraps
+    restart: {{ zabbix_server_restart_policy }}
+    ports:
+      - "{{ zabbix_server_listen_address }}:162:1162/udp"
+    volumes:
+      - {{ zabbix_server_data_dir }}/snmptraps:/var/lib/zabbix/snmptraps:rw
+    stop_grace_period: 5s
+    networks:
+      - zabbix
+
+  {% endif %}
+networks:
+  zabbix:
+    name: zabbix
+    driver: bridge

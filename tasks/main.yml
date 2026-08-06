@@ -1,23 +1,17 @@
 ---
 # Entry point.
 #
-# SKELETON. The assertions below are implemented; the deployment steps are still
-# to be filled in.
-#
 # Order matters: guard BEFORE touching the stack. An assertion that runs after
-# `docker compose up` has already lost.
+# `docker compose up` has already lost — by then PostgreSQL has initialised, the
+# server has rebuilt its schema, and every healthcheck is green against an empty
+# database.
 
 - name: Pre-flight — refuse to start against a database that would be silently recreated
   ansible.builtin.import_tasks: assert_db.yml
   tags: [zabbix, assert]
 
 - name: Deploy the Compose stack
-  ansible.builtin.debug:
-    msg: >-
-      TODO: render compose_pgsql.yaml and the .env_* override files from
-      templates/, then bring the stack up. Render them -- do not check out
-      zabbix-docker and git pull it, because the upstream upgrade docs warn that
-      git pull overwrites local edits.
+  ansible.builtin.import_tasks: deploy.yml
   tags: [zabbix, deploy]
 
 - name: Post-flight — a heartbeat must not be answerable by a proxy
