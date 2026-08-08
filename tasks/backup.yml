@@ -27,6 +27,11 @@
   # rather than discovering at 20:00 that an image update changed one.
   when: zabbix_server_backup_enabled | bool
   changed_when: false
+  # Read-only (a single SELECT), and exempt from --check for the same reason as
+  # the mount probe in assert_db.yml: skipped under --check it registers no
+  # stdout, and the task below would then read that as "not a superuser" and fail
+  # a dry run on a perfectly healthy stack.
+  check_mode: false
   community.docker.docker_container_exec:
     container: "{{ zabbix_server_db_container_name }}"
     command: >-

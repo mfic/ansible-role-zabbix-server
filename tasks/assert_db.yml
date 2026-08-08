@@ -41,6 +41,14 @@
   register: _zbx_mount
   changed_when: false
   failed_when: false
+  # ⚠ Without this the role cannot be dry-run AT ALL. `command` is skipped under
+  # --check, so _zbx_mount carries no rc and no stdout, the guard below reads
+  # that as "resolves to nothing" and REFUSES — on a host whose disk is mounted
+  # perfectly. The failure is indistinguishable from the real one it exists to
+  # catch, which makes --check useless at exactly the moment somebody reaches for
+  # it: before a change they are unsure about. Reading a mount table changes
+  # nothing, so it is safe to run in check mode.
+  check_mode: false
 
 - name: Fail when the data directory is not its own filesystem
   # This is an assertion rather than a warning, and the difference is the point.
