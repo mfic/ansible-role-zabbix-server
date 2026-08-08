@@ -51,6 +51,46 @@
       (`local all all trust`) and that {{ zabbix_server_db_user }} is the
       POSTGRES_USER the stack created.
 
+- name: Verify the read group can actually traverse the whole path to the dumps
+  # ⚠ THE CHECK THAT CATCHES THE NON-OBVIOUS HALF. Making the dump files
+  # group-readable is necessary and NOT sufficient: every ancestor directory has
+  # to grant execute as well, or the open fails with EACCES while the file's own
+  # permissions look exactly right. The symptom is an "unsupported" monitoring
+  # item, and the file it names is perfectly readable by root -- so the
+  # investigation goes to the file, the agent config and SELinux long before it
+  # goes to a parent directory three levels up.
+  #
+  # A directory is traversable here if `other` has +x, or it is owned by the read
+  # group and `group` has +x. Root's DAC bypass is why this cannot simply be
+  # tested by running stat as root.
+  when:
+    - zabbix_server_backup_enabled | bool
+    - zabbix_server_backup_read_group | length > 0
+  changed_when: false
+  check_mode: false
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      group={{ zabbix_server_backup_read_group | quote }}
+      path={{ zabbix_server_backup_dir | quote }}
+      rc=0
+      while [ "$path" != "/" ]; do
+        read -r mode owner_group <<<"$(stat -c '%a %G' "$path")"
+        other_x=$(( 8#$mode & 1 ))
+        group_x=$(( (8#$mode & 8) != 0 ))
+        if [ "$other_x" -eq 1 ]; then :
+        elif [ "$owner_group" = "$group" ] && [ "$group_x" -eq 1 ]; then :
+        else
+          echo "NOT TRAVERSABLE by group '$group': $path (mode $mode, group $owner_group)"
+          rc=1
+        fi
+        path=$(dirname "$path")
+      done
+      exit $rc
+  register: zabbix_server_backup_path_check
+  failed_when: zabbix_server_backup_path_check.rc != 0
+
 - name: Install the dump script
   when: zabbix_server_backup_enabled | bool
   ansible.builtin.template:

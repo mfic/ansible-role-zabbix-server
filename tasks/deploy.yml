@@ -71,7 +71,19 @@
     state: directory
     owner: root
     group: root
-    mode: "0750"
+    # ⚠ 0751 -- not 0750 -- when a monitoring group is meant to read the dumps,
+    # and the extra bit is EXECUTE only. The data directory normally sits under
+    # this one, so 0750 here denies the agent traversal to the backup directory
+    # no matter how the backup directory itself is owned: the dump ends up
+    # correctly group-readable and still unreadable, because the path to it is
+    # not walkable. That failure appears on the FILE's permissions, which are
+    # perfect, so it is diagnosed everywhere except where it lives.
+    #
+    # +x without +r grants traversal without listing, and every file in here
+    # keeps its own mode: .env stays 0600 and the compose file 0640 root-group.
+    # So nothing becomes readable that was not readable before -- the directory
+    # simply stops being a wall.
+    mode: "{{ (zabbix_server_backup_enabled | bool and zabbix_server_backup_read_group | length > 0) | ternary('0751', '0750') }}"
 
 - name: Create the persistent data directories
   ansible.builtin.file:
