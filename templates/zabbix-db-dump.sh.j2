@@ -100,6 +100,12 @@ sync -f "$DIR/zabbix-$ts.dump"
 # ⚠ Deliberately runs AFTER promotion and never on a failure path (set -e above
 # has already exited): a run that could not produce a good dump must not be the
 # run that deletes the last good one.
+{% raw %}
+# ⚠ EVERYTHING BELOW IS INSIDE A JINJA raw BLOCK, and it has to be. Bash's
+# array-length and prefix-strip expansions both start with a brace followed by a
+# hash -- which is exactly how a Jinja comment opens. Unescaped, the render dies
+# with "Missing end of comment tag" and points at a line some distance from the
+# actual cause. This comment lives inside the block for the same reason.
 mapfile -t dumps < <(find "$DIR" -maxdepth 1 -type f -name 'zabbix-*.dump' ! -name "$LATEST_DUMP" -printf '%f\n' | sort -r)
 if [ "${#dumps[@]}" -gt "$KEEP" ]; then
   for old in "${dumps[@]:$KEEP}"; do
@@ -108,6 +114,7 @@ if [ "${#dumps[@]}" -gt "$KEEP" ]; then
     rm -f -- "$DIR/$old" "$DIR/globals-$old_ts.sql"
   done
 fi
+{% endraw %}
 
 # Any .part left behind is the debris of a failed earlier run. It is never the
 # monitored name, so it is safe to clear once a run has succeeded.
