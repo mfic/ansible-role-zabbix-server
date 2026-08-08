@@ -30,6 +30,13 @@ services:
     # silent route to an empty database.
     volumes:
       - {{ zabbix_server_data_dir }}/postgresql/data:/var/lib/postgresql/data
+{% if zabbix_server_backup_enabled | bool %}
+      # Read-WRITE, and both directions are used: pg_dump writes the nightly
+      # archive here, and pg_restore reads it back during a recovery. A restore
+      # that cannot see the dump from inside the container is a restore that does
+      # not happen, which is the failure this mount exists to prevent.
+      - {{ zabbix_server_backup_dir }}:{{ zabbix_server_backup_container_dir }}
+{% endif %}
     environment:
       POSTGRES_USER: {{ zabbix_server_db_user }}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is unset — refusing to start}

@@ -1,0 +1,117 @@
+---
+# Nightly logical backup: the script, its systemd timer, and the checks that
+# stop it being installed in a shape that cannot work.
+#
+# Runs AFTER deploy.yml on purpose. The dump drives pg_dump inside the database
+# container over a bind mount deploy.yml renders, so installing the timer first
+# would arm a job whose target does not exist yet.
+
+- name: Assert the monitoring read group exists on the host
+  # ⚠ This is the check that turns the flagged failure into a loud one. If the
+  # group is named but absent, chgrp in the script fails every night at 20:00 --
+  # after the dump has already succeeded, so the archive is fine and only the
+  # promotion fails. The agent then reports "unsupported" on an item that looks
+  # correctly configured, and an unsupported item is not an alert.
+  when:
+    - zabbix_server_backup_enabled | bool
+    - zabbix_server_backup_read_group | length > 0
+  ansible.builtin.getent:
+    database: group
+    key: "{{ zabbix_server_backup_read_group }}"
+
+- name: Verify the database accepts a passwordless local connection as the superuser
+  # The whole dump path depends on two properties of the running container: the
+  # unix socket is trusted, and this role is a superuser (pg_dumpall
+  # --globals-only reads pg_authid, which a non-superuser cannot). Both are true
+  # of the official image as configured by this role -- so verify them once, here,
+  # rather than discovering at 20:00 that an image update changed one.
+  when: zabbix_server_backup_enabled | bool
+  changed_when: false
+  community.docker.docker_container_exec:
+    container: "{{ zabbix_server_db_container_name }}"
+    command: >-
+      psql -U {{ zabbix_server_db_user }} -d {{ zabbix_server_db_name }}
+      -tAc "select usesuper from pg_user where usename = current_user"
+  register: zabbix_server_backup_superuser_check
+
+- name: Fail when the dump could not authenticate or would not be permitted
+  when:
+    - zabbix_server_backup_enabled | bool
+    - "'t' not in zabbix_server_backup_superuser_check.stdout | default('')"
+  ansible.builtin.fail:
+    msg: >-
+      A passwordless local connection as {{ zabbix_server_db_user }} did not
+      return superuser. pg_dumpall --globals-only cannot run, so a restore onto
+      fresh PostgreSQL would fail before reading a row. Check the image's pg_hba
+      (`local all all trust`) and that {{ zabbix_server_db_user }} is the
+      POSTGRES_USER the stack created.
+
+- name: Install the dump script
+  when: zabbix_server_backup_enabled | bool
+  ansible.builtin.template:
+    src: zabbix-db-dump.sh.j2
+    dest: "{{ zabbix_server_backup_script_path }}"
+    owner: root
+    group: root
+    # 0750: it is root-only to run, but it is also documentation of the recovery
+    # path, and an operator reading it should not need to become root first.
+    mode: "0750"
+    validate: bash -n %s
+
+- name: Install the dump service and timer
+  when: zabbix_server_backup_enabled | bool
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - "{{ zabbix_server_backup_unit_name }}.service"
+    - "{{ zabbix_server_backup_unit_name }}.timer"
+
+- name: Enable the nightly dump timer
+  when: zabbix_server_backup_enabled | bool
+  ansible.builtin.systemd_service:
+    name: "{{ zabbix_server_backup_unit_name }}.timer"
+    enabled: true
+    state: started
+    # Inline rather than via a handler, deliberately. A handler runs at the END
+    # of the play, which is after this task -- so the first run would try to
+    # enable a unit systemd has not read yet. handlers/main.yml is also
+    # deliberately empty for reasons worth keeping intact; see its comment.
+    daemon_reload: true
+
+# ── Turning the feature off ──────────────────────────────────────────────────
+# Flipping the flag back to false must actually stop the job. Left armed, it
+# keeps writing dumps nobody watches into a directory nobody prunes, which is
+# how a data volume fills up on a server whose job is to notice that happening.
+- name: Stop and disable the timer when the feature is off
+  when: not (zabbix_server_backup_enabled | bool)
+  ansible.builtin.systemd_service:
+    name: "{{ zabbix_server_backup_unit_name }}.timer"
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Remove the units and script when the feature is off
+  when: not (zabbix_server_backup_enabled | bool)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/etc/systemd/system/{{ zabbix_server_backup_unit_name }}.timer"
+    - "/etc/systemd/system/{{ zabbix_server_backup_unit_name }}.service"
+    - "{{ zabbix_server_backup_script_path }}"
+  register: zabbix_server_backup_removed
+
+- name: Reload systemd after removing the units
+  when:
+    - not (zabbix_server_backup_enabled | bool)
+    - zabbix_server_backup_removed is changed
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# ⚠ The dumps themselves are NOT removed with the feature. Deleting backups
+# because a flag was flipped -- possibly by accident, possibly to disable the
+# timer for one maintenance window -- is not a decision a role gets to make.

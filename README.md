@@ -121,6 +121,43 @@ that every browser rejects, and a silent failure otherwise.
 Neither front door authenticates anyone. **Access policy is out of this role's scope**: it belongs
 to whatever sits in front of the tunnel, and to Zabbix's own user database.
 
+## The nightly database dump
+
+Off by default (`zabbix_server_backup_enabled`). When on, a systemd timer runs `pg_dump -Fc` plus
+`pg_dumpall --globals-only` into `zabbix_server_backup_dir`, keeping `zabbix_server_backup_keep`
+pairs and hard-linking the newest to stable `*-latest.*` names.
+
+**It is not redundant with a snapshot of the guest, and consistency is the least of the reason.** A
+snapshot preserves a corrupt page faithfully every night for as long as retention keeps it;
+`pg_dump` reads every row, so it *fails* on that page instead of archiving it. The dump also
+survives a PostgreSQL major-version change, which a copied `PGDATA` does not, and `pg_restore` can
+pull back a single table without standing up a guest.
+
+Four details are load-bearing rather than incidental:
+
+- **The globals are a separate artifact and not optional.** They are a few KiB, and without them a
+  restore onto fresh PostgreSQL fails before it reads a single row, because the role that owns every
+  object does not exist yet.
+- **The archive is written to a `.part` name and renamed.** `rename(2)` inside one filesystem is
+  atomic, so the monitored name never refers to a half-written archive. This is what makes
+  *overrunning the capture window safe*: a guest snapshot taken while tonight's dump is still running
+  captures yesterday's complete pair rather than today's stump. The cost is a day of RPO for that
+  night — which is what a dump-age trigger is for.
+- **It is verified before it is promoted.** `pg_restore -l` reads the archive's table of contents, so
+  a truncated dump is rejected. Size and mtime both look healthy on a truncated archive, so the
+  checks most likely to be monitoring it cannot catch this.
+- **`zabbix_server_backup_read_group` is what makes the dump monitorable.** The files are written by
+  the database container's uid; without a group an agent belongs to, `vfs.file.*` items on them
+  return *unsupported*, and an unsupported item is not an alert. The role asserts the group exists
+  rather than letting `chgrp` fail nightly after a successful dump.
+
+`zabbix_server_backup_dir` is bind-mounted read-write into the database container. Both directions
+are used: `pg_dump` writes there and `pg_restore` reads from there during a recovery — a restore that
+cannot see the dump from inside the container is a restore that does not happen.
+
+**What it is not: an off-host backup.** The dump lands on the same filesystem as the database it came
+from. Something outside this role has to capture that directory, and prove it has.
+
 ## What this role does *not* configure
 
 **Retention, and the two housekeeping override flags.** They are frontend settings stored in the

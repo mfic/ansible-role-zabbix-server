@@ -1,0 +1,117 @@
+#!/bin/bash
+# {{ ansible_managed }}
+#
+# Nightly logical backup of the Zabbix database.
+#
+# Two artifacts, because either alone is insufficient:
+#   - the database, custom format (-Fc), so pg_restore can be selective
+#   - the globals (roles/ownership), a few KiB. Without them a restore onto
+#     fresh PostgreSQL fails before it reads a single row, because the role that
+#     owns every object does not exist yet.
+#
+# Runs as root on the host and drives pg_dump INSIDE the database container.
+# There is no password anywhere in this path: the container's pg_hba grants
+# `local all all trust` on the unix socket, and the database superuser is the
+# same role the stack already uses. That is verified by the role at deploy time
+# rather than assumed here.
+
+set -euo pipefail
+
+DIR={{ zabbix_server_backup_dir | quote }}
+CDIR={{ zabbix_server_backup_container_dir | quote }}
+CONTAINER={{ zabbix_server_db_container_name | quote }}
+DB={{ zabbix_server_db_name | quote }}
+DBUSER={{ zabbix_server_db_user | quote }}
+KEEP={{ zabbix_server_backup_keep | int }}
+LATEST_DUMP={{ zabbix_server_backup_latest_dump | quote }}
+LATEST_GLOBALS={{ zabbix_server_backup_latest_globals | quote }}
+{% if zabbix_server_backup_read_group | length > 0 %}
+READ_GROUP={{ zabbix_server_backup_read_group | quote }}
+{% else %}
+READ_GROUP=""
+{% endif %}
+
+log() { printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+die() { log "FAILED: $*"; exit 1; }
+
+started=$(date +%s)
+ts=$(date -u '+%Y%m%dT%H%M%SZ')
+
+# ── Refuse early, and loudly ──────────────────────────────────────────────────
+# A dump attempted against a stopped container produces an empty file and a
+# confusing error. Checking first means the journal says "the database was not
+# running", which is a different problem with a different fix.
+docker inspect -f '{% raw %}{{.State.Running}}{% endraw %}' "$CONTAINER" 2>/dev/null | grep -qx true \
+  || die "container $CONTAINER is not running — nothing was dumped"
+
+# ── Dump ──────────────────────────────────────────────────────────────────────
+# Written with -f to a .part name inside the container, NOT redirected through
+# this shell's stdout. Redirection would create the destination file before
+# pg_dump has said anything, so a failure leaves a zero-length file with a
+# current mtime — which is precisely what an age-and-size check misreads as a
+# fresh backup.
+log "dumping $DB from $CONTAINER"
+docker exec "$CONTAINER" pg_dump -U "$DBUSER" -d "$DB" -Fc -f "$CDIR/zabbix-$ts.dump.part" \
+  || die "pg_dump failed"
+
+log "dumping globals"
+docker exec "$CONTAINER" pg_dumpall -U "$DBUSER" --globals-only -f "$CDIR/globals-$ts.sql.part" \
+  || die "pg_dumpall --globals-only failed"
+
+{% if zabbix_server_backup_verify | bool %}
+# ── Verify before promoting ───────────────────────────────────────────────────
+# Reads the archive header and table of contents. A truncated archive fails
+# here, while its size and mtime would both look perfectly healthy to the
+# monitoring items that watch this directory.
+log "verifying archive"
+docker exec "$CONTAINER" pg_restore -l "$CDIR/zabbix-$ts.dump.part" >/dev/null \
+  || die "pg_restore -l could not read the archive — refusing to promote it"
+{% endif %}
+
+# ── Promote atomically ────────────────────────────────────────────────────────
+# rename(2) within one filesystem is atomic, so the monitored name NEVER refers
+# to a partially written archive. This is what makes overrunning the capture
+# window safe rather than merely unlikely: a guest snapshot taken while tonight's
+# dump is still running captures YESTERDAY's complete pair, not today's stump.
+# The cost is a day of RPO for that night, which is exactly what the dump-age
+# trigger exists to report.
+mv -f "$DIR/zabbix-$ts.dump.part"   "$DIR/zabbix-$ts.dump"
+mv -f "$DIR/globals-$ts.sql.part"   "$DIR/globals-$ts.sql"
+
+ln -f "$DIR/zabbix-$ts.dump"  "$DIR/$LATEST_DUMP"
+ln -f "$DIR/globals-$ts.sql"  "$DIR/$LATEST_GLOBALS"
+
+# The files are created by the container's postgres uid. Group-read is what lets
+# a monitoring agent stat them; see zabbix_server_backup_read_group.
+if [ -n "$READ_GROUP" ]; then
+  chgrp "$READ_GROUP" "$DIR/zabbix-$ts.dump" "$DIR/globals-$ts.sql"
+fi
+chmod 0640 "$DIR/zabbix-$ts.dump" "$DIR/globals-$ts.sql"
+
+# Push it to disk. Everything above is a promise the page cache has not kept
+# yet, and the whole point of this file is to survive the host that wrote it.
+sync -f "$DIR/zabbix-$ts.dump"
+
+# ── Rotate ────────────────────────────────────────────────────────────────────
+# Newest $KEEP timestamped dumps survive, with their matching globals. Sorted by
+# NAME, which is safe only because the names are UTC timestamps in a sortable
+# format — do not change the name format without changing this.
+#
+# ⚠ Deliberately runs AFTER promotion and never on a failure path (set -e above
+# has already exited): a run that could not produce a good dump must not be the
+# run that deletes the last good one.
+mapfile -t dumps < <(find "$DIR" -maxdepth 1 -type f -name 'zabbix-*.dump' ! -name "$LATEST_DUMP" -printf '%f\n' | sort -r)
+if [ "${#dumps[@]}" -gt "$KEEP" ]; then
+  for old in "${dumps[@]:$KEEP}"; do
+    old_ts=${old#zabbix-}; old_ts=${old_ts%.dump}
+    log "rotating out $old"
+    rm -f -- "$DIR/$old" "$DIR/globals-$old_ts.sql"
+  done
+fi
+
+# Any .part left behind is the debris of a failed earlier run. It is never the
+# monitored name, so it is safe to clear once a run has succeeded.
+find "$DIR" -maxdepth 1 -type f -name '*.part' -mmin +60 -delete
+
+size=$(stat -c %s "$DIR/$LATEST_DUMP")
+log "done in $(( $(date +%s) - started ))s; ${size} bytes; keeping ${KEEP}"

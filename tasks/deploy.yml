@@ -112,6 +112,25 @@
   loop_control:
     label: "{{ item.path }}"
 
+# ⚠ Created HERE, before `docker compose up`, and not in backup.yml. It is the
+# source of a bind mount, and Docker creates a missing bind source itself --
+# as root:root 0755, silently, which is neither writable by the database
+# container's uid nor readable by the monitoring group. The wrong ownership then
+# looks like a permissions bug in the dump rather than a mount that was never
+# created by the thing that owns it.
+- name: Create the backup directory
+  when: zabbix_server_backup_enabled | bool
+  ansible.builtin.file:
+    path: "{{ zabbix_server_backup_dir }}"
+    state: directory
+    # Owned by the database container's uid because pg_dump -f, running inside
+    # that container, is what writes the files.
+    owner: "{{ zabbix_server_db_uid }}"
+    group: "{{ zabbix_server_backup_read_group | default(zabbix_server_db_gid, true) }}"
+    # 0750: the owner writes, the read group traverses and reads, nothing else
+    # sees a database dump at all.
+    mode: "0750"
+
 # ── Traefik ──────────────────────────────────────────────────────────────────
 # Under the data directory, so the ACME account key and the issued certificates
 # survive a rebuild on the same durable filesystem as the database. Losing

@@ -262,6 +262,76 @@ zabbix_server_availability_history_retention: "365d"
 #   zabbix[rcache,buffer,pfree]  and the vcache / trend / history equivalents
 zabbix_server_cache_sizes: {}                  # {} = ship upstream defaults
 
+# ── Nightly database dump ────────────────────────────────────────────────────
+# OFF by default: a timer that writes into a directory nothing watches, on a
+# host with no backup plant behind it, is worse than absent -- it looks like a
+# backup. Enable it where something actually captures the result.
+#
+# WHY A LOGICAL DUMP AT ALL, when the guest is already snapshotted: a snapshot
+# preserves a corrupt page faithfully, every night, for as long as retention
+# keeps. pg_dump READS EVERY ROW, so it fails on the corruption instead of
+# archiving it. It also survives a PostgreSQL major-version change, which a
+# copied PGDATA does not, and `pg_restore` can pull back one table without
+# standing up a guest.
+zabbix_server_backup_enabled: false
+
+# Under the data directory, so it inherits the dedicated filesystem and is
+# captured by whatever backs the guest up. NOT under the compose directory:
+# that holds rendered configuration, and mixing a growing artifact into it makes
+# the config directory's size unpredictable.
+zabbix_server_backup_dir: "{{ zabbix_server_data_dir }}/backup"
+
+# ⚠ Bind-mounted INTO the database container (read-write) when this feature is
+# enabled. That is not incidental convenience: `pg_dump -f` writes it and
+# `pg_restore` reads it, and both run inside the container, so a restore that
+# cannot see the file is a restore that does not happen. The container already
+# holds the same data live; the mount grants it no information it lacks.
+zabbix_server_backup_container_dir: /backup
+
+# ⚠ Local time, and it is a real constraint rather than a preference: it must
+# leave room for the dump to FINISH before whatever captures the guest runs.
+# See the atomic-rename note in the script -- overrunning is made safe rather
+# than merely unlikely, but a dump that never fits its window still costs a day
+# of RPO every night, silently, if nothing watches the dump's age.
+zabbix_server_backup_time: "20:00"
+
+# Two, not one and not three. One means the capture must always find a
+# COMPLETE dump even if tonight's is mid-write, and that yesterday's is gone
+# the moment tonight's begins. Three costs disk that a 48 GiB data volume
+# holding a growing database does not have to spare.
+zabbix_server_backup_keep: 2
+
+# Stable names, hard-linked to the newest timestamped pair. A monitoring item
+# needs ONE path whose mtime and size mean "the last backup"; globbing for the
+# newest file is not something an agent item can express.
+#
+# ⚠ Hard links, not symlinks. `stat` on a symlink reports the LINK unless the
+# caller follows it, and whether a given agent item follows is a detail nobody
+# should have to remember. A hard link is indistinguishable from the file.
+zabbix_server_backup_latest_dump: zabbix-latest.dump
+zabbix_server_backup_latest_globals: globals-latest.sql
+
+# Group granted read access to the dumps. Empty = nobody outside the owner.
+#
+# ⚠ Set this if a monitoring agent is meant to watch the dump. The directory is
+# owned by the DATABASE container's uid (it writes the files) with this group
+# readable; without it the agent's vfs.file.* items return "unsupported" no
+# matter how correct the trigger is, and an unsupported item is not a red
+# dashboard -- it is a trigger that never fires.
+zabbix_server_backup_read_group: ""
+
+# Verify the dump is readable by listing its table of contents before it is
+# promoted to the monitored name. Cheap (it reads the archive's header and TOC,
+# not the data) and it catches the failure that matters: a truncated or
+# unreadable archive that a size-and-age check calls healthy.
+zabbix_server_backup_verify: true
+
+# /usr/local/sbin, not the compose directory: it is an operator-runnable command
+# ("take a dump before this upgrade"), and it should be on the path an
+# administrator's shell already searches.
+zabbix_server_backup_script_path: /usr/local/sbin/zabbix-db-dump
+zabbix_server_backup_unit_name: zabbix-db-dump
+
 # Escape hatch for ZBX_* settings this role does not model. Rendered verbatim
 # into the server's environment. Kept last so it can override anything above --
 # and deliberately awkward to reach for, because a setting that matters belongs

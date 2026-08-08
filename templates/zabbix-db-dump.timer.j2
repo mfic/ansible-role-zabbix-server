@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Nightly logical backup of the Zabbix database
+
+[Timer]
+OnCalendar={{ zabbix_server_backup_time }}
+# ⚠ NO RandomizedDelaySec, deliberately. Jitter is the right default for a fleet
+# of timers hitting one server, and the wrong one here: this dump has to finish
+# inside a known window before whatever captures the guest runs, and a random
+# offset spends that window for no benefit -- there is exactly one of these.
+AccuracySec=1min
+# A guest that was down at the scheduled time dumps once it is back, rather than
+# skipping a day silently. Without this a reboot at 19:55 costs a night's dump
+# and nothing says so until the age trigger notices a day later.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

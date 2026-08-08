@@ -14,6 +14,13 @@
   ansible.builtin.import_tasks: deploy.yml
   tags: [zabbix, deploy]
 
+- name: Install the nightly database dump
+  # After deploy: the dump runs pg_dump inside the database container, over a
+  # bind mount the compose file renders. Arming the timer before the stack
+  # exists would schedule a job with nothing to talk to.
+  ansible.builtin.import_tasks: backup.yml
+  tags: [zabbix, backup]
+
 - name: Post-flight — a heartbeat must not be answerable by a proxy
   ansible.builtin.import_tasks: assert_monitoring.yml
   tags: [zabbix, assert]

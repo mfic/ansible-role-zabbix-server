@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Nightly logical backup of the Zabbix database
+Documentation=man:pg_dump(1)
+# The script refuses cleanly when the container is down, so this is an ordering
+# preference rather than a requirement -- a hard Requires= would make a docker
+# restart drag the dump along with it.
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart={{ zabbix_server_backup_script_path }}
+# The dump reads every row of the monitoring history. Niced so that a large
+# database being read at full speed does not compete with the collection the
+# server is doing at the same moment.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# No TimeoutStartSec override: a dump that is slow is still a dump worth having,
+# and killing it half-written would achieve nothing the .part naming does not
+# already handle safely.
