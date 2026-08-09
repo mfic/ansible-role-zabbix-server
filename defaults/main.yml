@@ -194,9 +194,20 @@ zabbix_server_assert_db_not_empty: true
 # Expect an existing DB. Set false ONLY for a genuine first build.
 zabbix_server_db_expect_existing: true
 
-# Verify via the API that the server's own host object is monitored by the
-# SERVER, never a proxy. Guards a heartbeat that a proxy would keep answering.
+# Verify against the database that the server's own host object is collected by
+# the SERVER, never a proxy. Guards a heartbeat that a proxy would keep
+# answering for a week after the server died. See tasks/assert_monitoring.yml
+# for why this reads PostgreSQL rather than the API.
 zabbix_server_assert_monitored_by_server: true
+
+# The TECHNICAL host name (not the visible name) of this server's own host
+# object in Zabbix — what the guard above looks up.
+#
+# ⚠ Declared here on purpose. It used to be read straight out of the consuming
+# inventory as an undeclared variable with a fallback, which meant a rename on
+# either side silently pointed the guard at a host that does not exist — and
+# "host not found" was then indistinguishable from "host is fine".
+zabbix_server_self_host_name: "{{ inventory_hostname }}"
 
 # ── Housekeeping and retention ───────────────────────────────────────────────
 # Server-managed housekeeping. Partition-based housekeeping (dropping chunks

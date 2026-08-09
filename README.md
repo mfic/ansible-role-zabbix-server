@@ -2,8 +2,8 @@
 
 Deploys the **Zabbix 7.0 LTS server** as a Docker Compose stack on Debian.
 
-**Status: deploys.** The compose stack, the volume layout and both safety assertions are
-implemented. Not yet run against a real host.
+**Status: in production.** The compose stack, the volume layout, the nightly dump and both safety
+assertions are implemented and running against a real server.
 
 ## Design
 
@@ -39,12 +39,33 @@ proxy executes the item and — because proxies buffer results while the server 
 **keeps pinging the external service for as long as `ProxyOfflineBuffer` allows**, commonly a week.
 The switch reports green throughout an outage it exists to detect.
 
-`tasks/assert_monitoring.yml` verifies via the API that the server's own host object is monitored by
-the server, and fails the run otherwise.
+`tasks/assert_monitoring.yml` reads the server's own host object out of PostgreSQL — in the
+container this role deployed, with the credentials this role already holds — and fails the run if
+`monitored_by` is anything but the server.
 
 Note this cannot fire in a proxy-less deployment, which is exactly why it is asserted rather than
 documented: by the time proxies are added, the interaction is easy to forget, and the symptom is a
 switch that simply never alerts.
+
+Set **`zabbix_server_self_host_name`** to the *technical* host name of that object if it is not the
+`inventory_hostname`.
+
+> ⚠ **This assertion did nothing for its first several releases, and reported `ok` while doing it.**
+> Worth reading if you write guards. It called `community.zabbix.zabbix_host_info`, whose modules run
+> over the `httpapi` connection plugin **on the control node** — where the frontend this role
+> deploys, bound to the guest's loopback, does not exist; and it carried `failed_when: false`. Under
+> that it tested `proxy_hostid`, a Zabbix **6.x** column that 7.0 replaced with `monitored_by` /
+> `proxyid` / `proxy_groupid`, so the missing key fell through `| default('0')` to *not proxied* and
+> the guard would have passed even over a working connection. Both defects share one shape: **a read
+> whose failure mode defaults to the value that passes is not a check.** The rewrite therefore fails
+> when it cannot ask the question, and prints when it can — an assertion that is only ever visible on
+> failure cannot be told apart from one that is not running.
+
+It does **not** use the Zabbix API, deliberately: an API call needs a Super admin login, which would
+make a Zabbix password a mandatory variable of a role that otherwise only needs a database one, and
+would put the PHP frontend among the guard's dependencies. `deploy.yml` already reads Zabbix's own
+tables (`select count(*) from users`) for the same reason. Reading that schema is fine; nothing here
+writes to it.
 
 ## Corrections to the upstream defaults
 

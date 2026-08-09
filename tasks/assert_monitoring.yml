@@ -1,6 +1,6 @@
 ---
-# Guard: the Zabbix server's own host object must be monitored by the SERVER,
-# never by a proxy.
+# Guard: the Zabbix server's own host object must be collected by the SERVER,
+# never by a proxy or a proxy group.
 #
 # A dead-man's-switch heartbeat is typically an HTTP agent item on this host
 # object. If the host is monitored by a proxy, the PROXY executes that item, and
@@ -11,32 +11,189 @@
 # ⚠ This cannot fire in a proxy-less deployment. That is the point: by the time
 # proxies are added, the interaction is easy to forget, and the symptom is a
 # switch that simply never alerts.
+#
+# ── ⚠ THIS FILE USED TO DO NOTHING, AND REPORTED "ok" WHILE DOING IT ──────────
+# Two independent defects, either one of which was enough on its own:
+#
+#   1. It called community.zabbix.zabbix_host_info. Every community.zabbix
+#      module runs over the `httpapi` connection plugin, which executes on the
+#      CONTROL NODE -- and this role publishes the frontend on 127.0.0.1 of the
+#      GUEST by default, so there was nothing there to connect to. The task
+#      carried `failed_when: false`, so it reported ok on every run.
+#   2. Even over a working connection it could not have fired: it tested
+#      `proxy_hostid`, a Zabbix 6.x column. Zabbix 7.0 replaced it with
+#      `monitored_by` + `proxyid` + `proxy_groupid`. The absent key fell through
+#      `| default('0')` to "not proxied", so the guard passed unconditionally.
+#
+# The lesson generalises past this file: a read whose failure mode is
+# `default(<the value that passes>)` is not a check. Below, every branch is
+# stated and none is silent -- a run that could not ask the question FAILS
+# rather than passing, and a run that did ask says what it saw.
+#
+# ── Why the database and not the API ─────────────────────────────────────────
+# This asks PostgreSQL directly, in the container this role deployed, with the
+# credentials this role already holds. The alternative -- `ansible.builtin.uri`
+# against the loopback frontend -- also works, but it needs a Zabbix API LOGIN,
+# i.e. a Super admin password as a new mandatory role variable, purely to run a
+# guard; and it puts the PHP frontend among the things the guard depends on, in
+# a role whose README calls that frontend the rung underneath everything else.
+#
+# Reading Zabbix's own tables is not a new pattern here: deploy.yml already
+# waits on `select count(*) from users`, for the same reason -- it is the only
+# interface that answers without an authenticated session. ⚠ Reading this schema
+# is fine; WRITING to it is not, and nothing here writes.
 
-- name: Look up the server's own host object
-  community.zabbix.zabbix_host_info:
-    host_name: "{{ zabbix_host_technical_name | default(inventory_hostname) }}"
+- name: Read the server's own host object from the database
+  # ⚠ The SQL arrives on STDIN rather than through `-c`, and that is not
+  # stylistic: psql does NOT interpolate `:'variables'` in a `-c` string -- it
+  # is handed to the server verbatim, which answers `syntax error at or near
+  # ":"`. Read from a file -- and `-f -` is a file -- interpolation happens, and
+  # `:'self'` quotes and escapes the value properly. That keeps a host name out
+  # of a hand-built SQL literal.
+  #
+  # ⚠ `flags <> 2` excludes HOST PROTOTYPES, which live in this same table and
+  # carry unresolved LLD macros in `host` ("{#HV.UUID}"). They are not unique --
+  # a stock template set produces several rows with identical names -- so
+  # without the filter this query can legitimately return more than one row.
+  community.docker.docker_container_exec:
+    container: "{{ zabbix_server_db_container_name }}"
+    argv:
+      - psql
+      - -U
+      - "{{ zabbix_server_db_user }}"
+      - -d
+      - "{{ zabbix_server_db_name }}"
+      - -t
+      - -A
+      - -F
+      - "|"
+      - -v
+      - ON_ERROR_STOP=1
+      - -v
+      - "self={{ zabbix_server_self_host_name }}"
+      - -f
+      - "-"
+    stdin: >-
+      select monitored_by, coalesce(proxyid, 0), coalesce(proxy_groupid, 0), status
+      from hosts where flags <> 2 and host = :'self';
   register: _zbx_self
-  # The host object does not exist during the very first build.
+  changed_when: false
   failed_when: false
+  # ⚠ Without this the guard is dead under --check: docker_container_exec has no
+  # check-mode support, so the task would be SKIPPED, the register would carry
+  # no rc, and the branches below would read that as something it is not.
+  # Reading a table changes nothing, so it is safe to run in check mode -- and a
+  # dry run that silently drops a safety assertion is worse than no dry run.
+  check_mode: false
+  when: zabbix_server_assert_monitored_by_server | bool
+
+- name: Fail when the proxy guard could not ask the question
+  # ⚠ "Could not check" and "checked, and it is fine" must never be the same
+  # answer. That conflation is exactly how this file spent its whole life
+  # reporting success. If the probe cannot run, the guard is OFF, and the run
+  # says so rather than continuing quietly.
+  ansible.builtin.fail:
+    msg: >-
+      The proxy guard could not run, so nothing on this run checked whether this
+      server's own host object is collected by a proxy. `psql` in container
+      "{{ zabbix_server_db_container_name }}" exited
+      {{ _zbx_self.rc | default('nothing — the task did not execute') }}.
+      {{ (_zbx_self.stderr | default('') | trim) or (_zbx_self.msg | default('no output')) }}
+      Usual causes: the database container is not running under that name, or
+      zabbix_server_db_user / zabbix_server_db_name do not match the deployment.
+      To deploy without this guard, set
+      zabbix_server_assert_monitored_by_server=false and understand that a
+      heartbeat on this host would then be a proxy's to answer.
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - (_zbx_self.rc | default(1)) != 0
+
+- name: Interpret the row
+  # monitored_by: 0 = server, 1 = proxy, 2 = proxy group. An absent host object
+  # yields no rows, hence an empty list -- distinguished below, never defaulted
+  # into the passing value.
+  ansible.builtin.set_fact:
+    _zbx_self_row: >-
+      {{ ((_zbx_self.stdout | default('')).splitlines()
+          | map('trim') | select | list | first | default('')).split('|') }}
+  when: zabbix_server_assert_monitored_by_server | bool
+
+- name: Report that the host object does not exist yet
+  # A genuine first build: the stack is up and nothing has created the server's
+  # own host object. Not a failure -- but announced, because "nothing to check"
+  # and "checked" are different results and only one of them means covered.
+  ansible.builtin.debug:
+    msg: >-
+      Proxy guard: no host object named "{{ zabbix_server_self_host_name }}"
+      exists yet, so there is nothing to check. Expected on a first build. It
+      stops being expected once a heartbeat item is configured — from then on
+      this message means the heartbeat sits on a DIFFERENT host object than the
+      one being guarded, and neither is protected.
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - _zbx_self_row | length < 4
+
+- name: Name what is collecting it
+  # Split out of the message below so the folded scalar stays a single line of
+  # Jinja. ⚠ A conditional expression wrapped across lines of a folded YAML
+  # scalar is a newline inside the expression, and the sibling hazard — a `#`
+  # inside one, which is NOT a comment — has already cost this estate a run.
+  ansible.builtin.set_fact:
+    _zbx_self_collector: >-
+      {{ 'PROXY (proxyid ' ~ _zbx_self_row[1] ~ ')' if _zbx_self_row[0] == '1' else 'PROXY GROUP (proxy_groupid ' ~ _zbx_self_row[2] ~ ')' }}
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - _zbx_self_row | length >= 4
+    - _zbx_self_row[0] != '0'
 
 - name: Assert the server host object is not monitored by a proxy
   ansible.builtin.fail:
     msg: >-
       The Zabbix server's own host object
-      ({{ zabbix_host_technical_name | default(inventory_hostname) }}) is
-      monitored by a PROXY, not by the server. A dead-man's-switch heartbeat item
-      on this host would then be executed by the proxy, which buffers for
-      ProxyOfflineBuffer and would hold the external switch GREEN long after the
-      server died. Set "Monitored by" to Zabbix server.
+      ("{{ zabbix_server_self_host_name }}") is monitored by a
+      {{ _zbx_self_collector }},
+      not by the server. A dead-man's-switch heartbeat item on this host would
+      then be executed by the proxy, which buffers for ProxyOfflineBuffer and
+      would hold the external switch GREEN long after the server died. Set
+      "Monitored by" to Zabbix server.
   when:
     - zabbix_server_assert_monitored_by_server | bool
-    - _zbx_self.hosts | default([]) | length > 0
-    - (_zbx_self.hosts[0].proxy_hostid | default('0')) not in ['0', 0, None]
+    - _zbx_self_row | length >= 4
+    - _zbx_self_row[0] != '0'
 
-- name: Remind that the heartbeat item itself is not yet verified
+- name: Report the proxy guard result
+  # ⚠ A passing guard prints. An assertion visible only when it fails cannot be
+  # told apart from one that is not running -- which is the exact condition this
+  # file was in for its entire existence.
   ansible.builtin.debug:
     msg: >-
-      TODO: verify the heartbeat HTTP agent item exists on this host and is
-      enabled. A switch that was never configured is indistinguishable from one
-      that is working, until the day it matters.
-  when: zabbix_deadmans_switch_enabled | default(false) | bool
+      Proxy guard: "{{ zabbix_server_self_host_name }}" is collected by the
+      SERVER (monitored_by=0, status={{ _zbx_self_row[3] }}).
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - _zbx_self_row | length >= 4
+    - _zbx_self_row[0] == '0'
+
+- name: Warn that the guarded host object is disabled
+  # Not a failure: a deliberately disabled host is a legitimate state for this
+  # role to find, and refusing to deploy over it would be the role overreaching.
+  # But an item on a disabled host is not collected at all, so a heartbeat there
+  # is silently dead — worth saying out loud next to the guard that protects it.
+  ansible.builtin.debug:
+    msg: >-
+      ⚠ "{{ zabbix_server_self_host_name }}" is DISABLED (status=1). No item on
+      it is collected, so any dead-man's-switch heartbeat on this host is not
+      pinging and the external switch will fire.
+  when:
+    - zabbix_server_assert_monitored_by_server | bool
+    - _zbx_self_row | length >= 4
+    - _zbx_self_row[3] == '1'
+
+- name: Report that the proxy guard is switched off
+  ansible.builtin.debug:
+    msg: >-
+      ⚠ zabbix_server_assert_monitored_by_server is false, so nothing checked
+      whether this server's own host object is collected by a proxy. With
+      ProxyOfflineBuffer at its default, a proxy holds an external dead-man's
+      switch green for a week after the server dies.
+  when: not (zabbix_server_assert_monitored_by_server | bool)
