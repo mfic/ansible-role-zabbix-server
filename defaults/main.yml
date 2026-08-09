@@ -262,6 +262,41 @@ zabbix_server_availability_history_retention: "365d"
 #   zabbix[rcache,buffer,pfree]  and the vcache / trend / history equivalents
 zabbix_server_cache_sizes: {}                  # {} = ship upstream defaults
 
+# ── File-descriptor limit for the server container ───────────────────────────
+# ⚠ NOT a tuning knob. Two upstream defaults are mutually inconsistent, and the
+# gap between them is a live trap:
+#
+#   StartHTTPAgentPollers    = 1     -> ONE process serves every HTTP agent item
+#   MaxConcurrentChecksPerPoller = 1000  -> that process may run 1000 at once
+#
+# ...inside a container whose default `nofile` SOFT limit is 1024. A poller
+# allowed a thousand concurrent checks cannot hold a thousand sockets, so once
+# enough HTTP agent items exist the process pins at its limit and every further
+# socket call fails instantly.
+#
+# ⚠ THE SYMPTOMS NAME THE WRONG CULPRIT, which is why this is worth a variable
+# and this much comment. Out of descriptors, the errors read as network and DNS
+# faults:
+#
+#   Failed to connect to <ip>:<port> after 0 ms: Could not connect to server
+#   Could not resolve host: <name> (Could not contact DNS servers)
+#
+# "after 0 ms" is the tell -- a connect that fails in zero milliseconds never
+# reached the network, and the DNS error means it could not open a socket to
+# ASK. Both resolve perfectly from a shell in the same container, so the obvious
+# checks all exonerate the real cause.
+#
+# ⚠ It degrades UNEVENLY and SILENTLY. Items sharing the exhausted poller fail
+# while everything on other pollers keeps working, so the server looks healthy.
+# Anything driven by an HTTP agent item -- including a dead-man's-switch
+# heartbeat -- goes quiet without the server ever reporting itself unwell, and a
+# restart "fixes" it for as long as it takes to fill up again.
+#
+# Observed with roughly 180 HTTP agent items (the official Proxmox VE template
+# on one cluster is enough on its own). 65536 leaves ample headroom above
+# MaxConcurrentChecksPerPoller; raise it further if you raise that.
+zabbix_server_nofile_limit: 65536
+
 # ── Nightly database dump ────────────────────────────────────────────────────
 # OFF by default: a timer that writes into a directory nothing watches, on a
 # host with no backup plant behind it, is worse than absent -- it looks like a

@@ -117,6 +117,16 @@ services:
       - {{ zabbix_server_data_dir }}/snmptraps:/var/lib/zabbix/snmptraps:ro
       {% endif %}
     stop_grace_period: 30s
+    # ⚠ The container default soft limit is 1024, and one HTTP agent poller is
+    # allowed MaxConcurrentChecksPerPoller (1000) concurrent checks — so a
+    # server with enough HTTP agent items pins that process at its limit and
+    # every socket call then fails INSTANTLY, reporting itself as a network or
+    # DNS fault. See zabbix_server_nofile_limit in defaults/main.yml for the
+    # full failure signature; it is not one anybody guesses from the errors.
+    ulimits:
+      nofile:
+        soft: {{ zabbix_server_nofile_limit }}
+        hard: {{ zabbix_server_nofile_limit }}
     sysctls:
       # fping runs setuid-less in this image and needs unprivileged ICMP.
       # Without it every ICMP check reports the host down — the same failure
