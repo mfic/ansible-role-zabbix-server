@@ -267,6 +267,15 @@
   retries: 60
   delay: 10
   changed_when: false
+  # ⚠ The invariant this role holds to: `changed_when: false` means the task
+  # changes nothing, and a task that changes nothing should RUN under --check.
+  # That is check mode's contract, not an exception to it. Skip it instead and
+  # `_zbx_seeded` arrives as a bare dict, so the `until` above dies with
+  # "object of type 'dict' has no attribute 'stdout'" -- naming neither check
+  # mode nor this task. `docker_container_exec` has no check-mode support, so
+  # without this line the role stops being dry-runnable here. Counting rows
+  # changes nothing.
+  check_mode: false
   failed_when: false
 
 - name: Fail when the database never finished seeding
@@ -298,6 +307,11 @@
   retries: 30
   delay: 5
   changed_when: false
+  # ⚠ Same invariant as the seed wait above, and `uri` is the module it bites
+  # hardest: it declares no check-mode support, so under --check it is skipped
+  # and `_zbx_ping.status` does not exist for the `until` to read. A GET of
+  # /ping changes nothing.
+  check_mode: false
   # ⚠ A 200 from /ping proves the frontend and its database connection are
   # alive. It does NOT prove the database is the right one -- a freshly
   # initialised empty Zabbix answers this identically. That is what the
@@ -326,6 +340,10 @@
     executable: /bin/bash
   register: _zbx_cert
   changed_when: false
+  # ⚠ Same invariant again. Reading back the certificate an already-running
+  # Traefik is serving changes nothing, and skipping it under --check leaves
+  # `_zbx_cert.stdout` undefined for the assertion below.
+  check_mode: false
   # Deliberately matches on the DEFAULT cert rather than on an expected issuer
   # name: it is the one string that unambiguously means "ACME has not
   # succeeded", and it stays true whether the CA is Let's Encrypt production,
